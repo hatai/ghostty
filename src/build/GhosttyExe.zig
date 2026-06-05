@@ -50,6 +50,15 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     switch (cfg.target.result.os.tag) {
         .windows => {
             exe.subsystem = .Windows;
+
+            // With the Windows subsystem the MSVC CRT defaults to the
+            // WinMainCRTStartup entry point, which requires a WinMain
+            // function. Zig's std.start only provides `main`, so we
+            // explicitly use the console CRT entry point which calls
+            // `main` after CRT initialization. The subsystem above still
+            // prevents a console window from being created.
+            exe.entry = .{ .symbol_name = "mainCRTStartup" };
+
             exe.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
             });

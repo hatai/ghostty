@@ -88,7 +88,7 @@ pub const ClipboardRequest = union(ClipboardRequestType) {
             .{ .name = "GhosttyClipboardRequest" },
         ),
 
-        .none => void,
+        .none, .win32 => void,
     };
 };
 
