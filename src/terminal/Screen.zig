@@ -13,6 +13,7 @@ const tripwire = @import("../tripwire.zig");
 const unicode = @import("../unicode/main.zig");
 const Selection = @import("Selection.zig");
 const PageList = @import("PageList.zig");
+const selection_codepoints = @import("selection_codepoints.zig");
 const StringMap = @import("StringMap.zig");
 const ScreenFormatter = @import("formatter.zig").ScreenFormatter;
 const osc = @import("osc.zig");
@@ -1766,7 +1767,11 @@ pub inline fn resize(
         .rows = opts.rows,
         .cols = opts.cols,
         .reflow = opts.reflow,
-        .cursor = .{ .x = self.cursor.x, .y = self.cursor.y },
+        .cursor = .{
+            .x = self.cursor.x,
+            .y = self.cursor.y,
+            .pin = self.cursor.page_pin,
+        },
     });
 
     // If we have no scrollback and we shrunk our rows, we must explicitly
@@ -2512,7 +2517,7 @@ pub const SelectLine = struct {
 
     /// These are the codepoints to consider whitespace to trim
     /// from the ends of the selection.
-    whitespace: ?[]const u21 = &.{ 0, ' ', '\t' },
+    whitespace: ?[]const u21 = &selection_codepoints.default_line_whitespace,
 
     /// If true, line selection will consider semantic prompt
     /// state changing a boundary. State changing is ANY state
@@ -2648,10 +2653,10 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
             if (!cell.hasText()) continue;
 
             // Non-empty means we found it.
-            const this_whitespace = std.mem.indexOfAny(
+            const this_whitespace = std.mem.indexOfScalar(
                 u21,
                 whitespace,
-                &[_]u21{cell.content.codepoint},
+                cell.content.codepoint,
             ) != null;
             if (this_whitespace) continue;
 
@@ -2670,10 +2675,10 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
             if (!cell.hasText()) continue;
 
             // Non-empty means we found it.
-            const this_whitespace = std.mem.indexOfAny(
+            const this_whitespace = std.mem.indexOfScalar(
                 u21,
                 whitespace,
-                &[_]u21{cell.content.codepoint},
+                cell.content.codepoint,
             ) != null;
             if (this_whitespace) continue;
 
@@ -2794,10 +2799,10 @@ pub fn selectWord(
     if (!start_cell.hasText()) return null;
 
     // Determine if we are a boundary or not to determine what our boundary is.
-    const expect_boundary = std.mem.indexOfAny(
+    const expect_boundary = std.mem.indexOfScalar(
         u21,
         boundary_codepoints,
-        &[_]u21{start_cell.content.codepoint},
+        start_cell.content.codepoint,
     ) != null;
 
     // Go forwards to find our end boundary
@@ -2812,10 +2817,10 @@ pub fn selectWord(
             if (!cell.hasText()) break :end prev;
 
             // If we do not match our expected set, we hit a boundary
-            const this_boundary = std.mem.indexOfAny(
+            const this_boundary = std.mem.indexOfScalar(
                 u21,
                 boundary_codepoints,
-                &[_]u21{cell.content.codepoint},
+                cell.content.codepoint,
             ) != null;
             if (this_boundary != expect_boundary) break :end prev;
 
@@ -2849,10 +2854,10 @@ pub fn selectWord(
             if (!cell.hasText()) break :start prev;
 
             // If we do not match our expected set, we hit a boundary
-            const this_boundary = std.mem.indexOfAny(
+            const this_boundary = std.mem.indexOfScalar(
                 u21,
                 boundary_codepoints,
-                &[_]u21{cell.content.codepoint},
+                cell.content.codepoint,
             ) != null;
             if (this_boundary != expect_boundary) break :start prev;
 
@@ -6497,6 +6502,86 @@ test "Screen: resize more cols with populated scrollback" {
     }
 }
 
+test "Screen: resize more cols bounded scrollback keeps viewport valid" {
+    // Regression test for issue #12298.
+    //
+    // This needs to live at the Screen layer rather than PageList because the
+    // bad state only appears once Screen forwards the active cursor into the
+    // resize path. A direct PageList resize repro does not hit the same bug.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{
+        .cols = 2,
+        .rows = 10,
+        .max_scrollback = 10_000,
+    });
+    defer s.deinit();
+
+    // Build 30 rows of scrollback on top of our 10-row viewport so we have a
+    // 40-row screen with history above the active area.
+    for (0..30) |_| _ = try s.pages.grow();
+    s.cursorReload();
+    try testing.expectEqual(@as(usize, 40), s.pages.scrollbar().total);
+
+    // Fill the entire screen with two-row wrapped runs:
+    // - even rows mark the end of a wrapped line
+    // - odd rows mark the continuation
+    //
+    // With 2 columns, each logical line occupies two rows. When we grow to 4
+    // columns with reflow enabled, those pairs unwrap back into single rows.
+    // That cuts the total row count down and is what stresses the viewport pin.
+    var it = s.pages.pageIterator(.right_down, .{ .screen = .{} }, null);
+    while (it.next()) |chunk| {
+        const page = &chunk.node.data;
+        for (chunk.start..chunk.end) |y| {
+            const rac = page.getRowAndCell(0, y);
+            if (y % 2 == 0) {
+                rac.row.wrap = true;
+            } else {
+                rac.row.wrap_continuation = true;
+            }
+
+            for (0..s.pages.cols) |x| {
+                page.getRowAndCell(x, y).cell.* = .{
+                    .content_tag = .codepoint,
+                    .content = .{ .codepoint = 'A' },
+                };
+            }
+        }
+    }
+
+    // Pin the viewport to a history row just above the active area.
+    //
+    // Before resize:
+    // - total rows = 40
+    // - active area starts at row 30
+    // - viewport is pinned at row 28
+    //
+    // After unwrap during resize:
+    // - total rows shrinks to 20
+    // - the old row 28 remaps into what is now the active area
+    //
+    // The bug was that resize/grow would temporarily keep the viewport as a
+    // history pin even after reflow had moved it into the active area, leaving
+    // fewer than `rows` visible rows beneath the pin and tripping integrity
+    // checks.
+    s.pages.scroll(.{ .pin = s.pages.pin(.{ .screen = .{ .y = 28 } }).? });
+    try testing.expect(s.pages.viewport == .pin);
+    try testing.expect(s.pages.getBottomRight(.viewport) != null);
+
+    // Growing columns triggers reflow, which unwraps the synthetic wrapped
+    // rows above. This used to panic during the resize path.
+    try s.resize(.{ .cols = 4, .rows = s.pages.rows, .reflow = true });
+
+    // After the fix, the viewport is normalized back to the active area as
+    // soon as the pinned row lands there, so viewport queries remain valid.
+    try testing.expectEqual(@as(usize, 4), s.pages.cols);
+    try testing.expect(s.pages.scrollbar().total < 40);
+    try testing.expect(s.pages.viewport == .active);
+    try testing.expect(s.pages.getBottomRight(.viewport) != null);
+}
+
 test "Screen: resize more cols with reflow" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -7197,6 +7282,41 @@ test "Screen: resize less cols to eliminate wide char with row space" {
     }
 }
 
+test "Screen: resize less cols reflows cursor after wrapped text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 50, .rows = 7, .max_scrollback = 0 });
+    defer s.deinit();
+
+    for (0..30) |_| try s.testWriteString("a");
+
+    try testing.expectEqual(@as(usize, 0), s.cursor.y);
+    try testing.expectEqual(@as(usize, 30), s.cursor.x);
+
+    try s.resize(.{ .cols = 25, .rows = 7 });
+
+    try testing.expectEqual(@as(usize, 1), s.cursor.y);
+    try testing.expectEqual(@as(usize, 5), s.cursor.x);
+}
+
+test "Screen: resize less cols reflows cursor after empty cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var s = try Screen.init(alloc, .{ .cols = 10, .rows = 3, .max_scrollback = 0 });
+    defer s.deinit();
+
+    try s.testWriteString("abc");
+    s.cursorRight(6);
+
+    try testing.expectEqual(@as(usize, 0), s.cursor.y);
+    try testing.expectEqual(@as(usize, 9), s.cursor.x);
+
+    try s.resize(.{ .cols = 5, .rows = 3 });
+
+    try testing.expectEqual(@as(usize, 1), s.cursor.y);
+    try testing.expectEqual(@as(usize, 4), s.cursor.x);
+}
+
 test "Screen: resize more cols with wide spacer head" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -7530,6 +7650,32 @@ test "Screen: select untracked" {
     try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
     try s.select(null);
     try testing.expectEqual(tracked, s.pages.countTrackedPins());
+}
+
+test "Screen: select replaces existing pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 10, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("ABC  DEF\n 123\n456");
+
+    const tracked = s.pages.countTrackedPins();
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
+
+    // Replacing the selection must untrack the prior selection's pins
+    // rather than leak them.
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+        false,
+    ));
+    try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
 }
 
 test "Screen: selectAll" {

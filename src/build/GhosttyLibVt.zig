@@ -4,9 +4,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const RunStep = std.Build.Step.Run;
+const CombineArchivesStep = @import("CombineArchivesStep.zig");
 const Config = @import("Config.zig");
 const GhosttyZig = @import("GhosttyZig.zig");
-const LibtoolStep = @import("LibtoolStep.zig");
 const LipoStep = @import("LipoStep.zig");
 const SharedDeps = @import("SharedDeps.zig");
 const XCFrameworkStep = @import("XCFrameworkStep.zig");
@@ -287,7 +287,7 @@ fn initLib(
         try sources.append(b.allocator, lib.getEmittedBin());
         try sources.appendSlice(b.allocator, zig.simd_libs.items);
 
-        const combined = combineArchives(b, target, sources.items);
+        const combined = CombineArchivesStep.create(b, target, "ghostty-vt", sources.items);
         combined.step.dependOn(&lib.step);
 
         return .{
@@ -312,46 +312,9 @@ fn initLib(
     };
 }
 
-/// Combine multiple static archives into a single fat archive.
-/// Uses libtool on Darwin and ar MRI scripts on other platforms.
-fn combineArchives(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    sources: []const std.Build.LazyPath,
-) struct { step: *std.Build.Step, output: std.Build.LazyPath } {
-    if (target.result.os.tag.isDarwin()) {
-        const libtool = LibtoolStep.create(b, .{
-            .name = "ghostty-vt",
-            .out_name = "libghostty-vt.a",
-            .sources = @constCast(sources),
-        });
-        return .{ .step = libtool.step, .output = libtool.output };
-    }
-
-    // On non-Darwin, use a build tool that generates an MRI script and
-    // pipes it to `zig ar -M`. This works on all platforms including
-    // Windows (the previous /bin/sh approach did not).
-    const tool = b.addExecutable(.{
-        .name = "combine_archives",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/build/combine_archives.zig"),
-            .target = b.graph.host,
-        }),
-    });
-    const run = b.addRunArtifact(tool);
-    run.addArg(b.graph.zig_exe);
-    const output = run.addOutputFileArg("libghostty-vt.a");
-    for (sources) |source| run.addFileArg(source);
-
-    return .{ .step = &run.step, .output = output };
-}
-
 /// Returns the Libs.private value for the pkg-config file.
-/// This includes the C++ standard library needed by SIMD code.
-///
-/// Zig compiles C++ code with LLVM's libc++ (not GNU libstdc++),
-/// so consumers linking the static library need a libc++-compatible
-/// toolchain: `zig cc`, `clang`, or GCC with `-lc++` installed.
+/// Vendored C++ dependencies are built in no-libcxx mode so consumers
+/// don't need libc++.  System-provided simdutf still requires it.
 fn libsPrivate(
     zig: *const GhosttyZig,
 ) []const u8 {
