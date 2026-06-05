@@ -905,6 +905,10 @@ pub fn performAction(
             return window.gotoTab(value);
         },
         .show_gtk_inspector => return false,
+
+        // Win32 has no accessibility consumer for this yet.
+        .selection_changed => return false,
+
         .render_inspector => {
             const core = switch (target) {
                 .app => return false,
@@ -965,6 +969,10 @@ pub fn performIpc(
     const stderr = &stderr_writer.interface;
 
     switch (action) {
+        // The quick terminal is not supported on Windows yet, so we
+        // return false so the CLI reports it as unsupported.
+        .toggle_quick_terminal => return false,
+
         .new_window => {
             switch (target) {
                 .class => |class| {
