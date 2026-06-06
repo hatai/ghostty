@@ -194,9 +194,15 @@ pub fn setSearchSelected(self: *Self, selected: ?usize) void {
 }
 
 fn updateStatus(self: *Self) void {
-    // bErase=1: the status string can shrink, so the bottom row must be
-    // cleared (WM_ERASEBKGND) before paint() redraws it transparently.
-    if (self.hwnd) |h| _ = sys.InvalidateRect(h, null, 1);
+    // Only the bottom row (status + hints) changes; erasing just that
+    // region avoids repainting under the EDIT on every keystroke while
+    // still clearing ghost glyphs when the status string shrinks.
+    const h = self.hwnd orelse return;
+    const t = &(self.theme orelse return);
+    var rc: sys.RECT = std.mem.zeroes(sys.RECT);
+    _ = sys.GetClientRect(h, &rc);
+    rc.top = t.s(input_top) + t.s(input_h);
+    _ = sys.InvalidateRect(h, &rc, 1);
 }
 
 fn emitSearchChanged(self: *Self) void {
