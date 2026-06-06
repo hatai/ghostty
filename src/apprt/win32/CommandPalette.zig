@@ -10,6 +10,7 @@ const Command = input.command.Command;
 const sys = @import("sys.zig");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const TitleBar = @import("TitleBar.zig");
 
 const log = std.log.scoped(.win32_cmd_palette);
 
@@ -205,11 +206,17 @@ fn open(self: *CommandPalette, window: *Window) !void {
         const face_name = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
         ui_font = CreateFontW(
             -18, // height in pixels (negative = em height)
-            0, 0, 0,
+            0,
+            0,
+            0,
             400, // FW_NORMAL
-            0, 0, 0,
+            0,
+            0,
+            0,
             1, // DEFAULT_CHARSET
-            0, 0, 0,
+            0,
+            0,
+            0,
             0,
             face_name,
         );
@@ -471,4 +478,180 @@ pub fn handleKey(self: *CommandPalette, vk: WPARAM) bool {
         },
         else => return false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy matching
+// ---------------------------------------------------------------------------
+
+/// A filtered command entry: which command, how well it matched, and
+/// which title bytes matched (for highlight rendering).
+const Match = struct {
+    cmd_idx: usize,
+    score: i32,
+    /// Bit i set = title byte i matched (first 64 bytes only). Empty
+    /// when the match was against the action name, not the title.
+    positions: std.StaticBitSet(64),
+};
+
+/// Result of a fuzzy match against a single string.
+const FuzzyResult = struct {
+    score: i32,
+    positions: std.StaticBitSet(64),
+};
+
+/// Case-insensitive subsequence match of `query` in `text`: every query
+/// byte must appear in order. Scoring: +10 word start (string start or
+/// after space/underscore), +5 consecutive match, -1 per gap byte
+/// (capped at -10 per gap). Returns null when not a subsequence.
+/// An empty query matches everything with score 0.
+fn fuzzyMatch(text: []const u8, query: []const u8) ?FuzzyResult {
+    var result: FuzzyResult = .{
+        .score = 0,
+        .positions = std.StaticBitSet(64).initEmpty(),
+    };
+    if (query.len == 0) return result;
+
+    var ti: usize = 0;
+    var prev: ?usize = null;
+    for (query) |qc| {
+        const ql = std.ascii.toLower(qc);
+        while (ti < text.len and std.ascii.toLower(text[ti]) != ql) ti += 1;
+        if (ti >= text.len) return null;
+
+        if (ti == 0 or text[ti - 1] == ' ' or text[ti - 1] == '_') {
+            result.score += 10;
+        }
+        if (prev) |p| {
+            if (ti == p + 1)
+                result.score += 5
+            else
+                result.score -= @intCast(@min(ti - p - 1, 10));
+        }
+        if (ti < 64) result.positions.set(ti);
+        prev = ti;
+        ti += 1;
+    }
+    return result;
+}
+
+test "fuzzyMatch subsequence and ordering" {
+    // In-order subsequence matches; out-of-order does not.
+    try std.testing.expect(fuzzyMatch("New Tab", "nt") != null);
+    try std.testing.expect(fuzzyMatch("New Tab", "tn") == null);
+    try std.testing.expect(fuzzyMatch("New Tab", "") != null);
+    try std.testing.expect(fuzzyMatch("abc", "abcd") == null);
+}
+
+test "fuzzyMatch scoring prefers word starts and consecutive runs" {
+    // "New Tab": n@0 (word start) + t@4 (word start, gap 3)
+    const word_starts = fuzzyMatch("New Tab", "nt").?;
+    // "Inspector": n@1, t@6 (no word starts, gap 4)
+    const gapped = fuzzyMatch("Inspector", "nt").?;
+    try std.testing.expect(word_starts.score > gapped.score);
+
+    // Consecutive beats gapped for the same text.
+    const consec = fuzzyMatch("tab", "ta").?;
+    const gap = fuzzyMatch("t_a_b", "tb").?;
+    try std.testing.expect(consec.score > gap.score);
+
+    // Positions recorded for highlighting.
+    try std.testing.expect(word_starts.positions.isSet(0));
+    try std.testing.expect(word_starts.positions.isSet(4));
+    try std.testing.expect(!word_starts.positions.isSet(1));
+}
+
+// ---------------------------------------------------------------------------
+// Keybind trigger formatting
+// ---------------------------------------------------------------------------
+
+/// Tiny bounded string builder (std.io writers are avoided on purpose;
+/// this only ever produces short ASCII-ish labels).
+const LabelBuf = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn add(self: *LabelBuf, str: []const u8) void {
+        const n = @min(str.len, self.buf.len - self.len);
+        @memcpy(self.buf[self.len..][0..n], str[0..n]);
+        self.len += n;
+    }
+
+    fn addByte(self: *LabelBuf, b: u8) void {
+        if (self.len < self.buf.len) {
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+    }
+};
+
+/// Format a binding trigger like "Ctrl+Shift+T". Mods are ordered
+/// Ctrl, Alt, Shift, Win. Returns a slice of `buf`.
+fn formatTrigger(buf: []u8, trigger: input.Binding.Trigger) []const u8 {
+    var lb: LabelBuf = .{ .buf = buf };
+    if (trigger.mods.ctrl) lb.add("Ctrl+");
+    if (trigger.mods.alt) lb.add("Alt+");
+    if (trigger.mods.shift) lb.add("Shift+");
+    if (trigger.mods.super) lb.add("Win+");
+    switch (trigger.key) {
+        .physical => |k| writeKeyName(&lb, @tagName(k)),
+        .unicode => |cp| {
+            if (cp < 128) {
+                lb.addByte(std.ascii.toUpper(@intCast(cp)));
+            } else {
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &utf8) catch 0;
+                lb.add(utf8[0..n]);
+            }
+        },
+        .catch_all => lb.add("Any"),
+    }
+    return lb.buf[0..lb.len];
+}
+
+/// Map a physical-key tag name to a display name: "key_a" -> "A",
+/// "digit_1" -> "1", "f11" -> "F11", "enter" -> "Enter",
+/// "page_up" -> "Page Up".
+fn writeKeyName(lb: *LabelBuf, tag: []const u8) void {
+    if (std.mem.startsWith(u8, tag, "key_") and tag.len == 5) {
+        lb.addByte(std.ascii.toUpper(tag[4]));
+        return;
+    }
+    if (std.mem.startsWith(u8, tag, "digit_")) {
+        lb.add(tag[6..]);
+        return;
+    }
+    // Capitalize each '_'-separated word: "page_up" -> "Page Up".
+    var it = std.mem.splitScalar(u8, tag, '_');
+    var first = true;
+    while (it.next()) |word| {
+        if (word.len == 0) continue;
+        if (!first) lb.addByte(' ');
+        lb.addByte(std.ascii.toUpper(word[0]));
+        lb.add(word[1..]);
+        first = false;
+    }
+}
+
+test "formatTrigger" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Ctrl+Shift+T", formatTrigger(&buf, .{
+        .mods = .{ .ctrl = true, .shift = true },
+        .key = .{ .physical = .key_t },
+    }));
+    try std.testing.expectEqualStrings("F11", formatTrigger(&buf, .{
+        .key = .{ .physical = .f11 },
+    }));
+    try std.testing.expectEqualStrings("Ctrl+1", formatTrigger(&buf, .{
+        .mods = .{ .ctrl = true },
+        .key = .{ .physical = .digit_1 },
+    }));
+    try std.testing.expectEqualStrings("Alt+Page Up", formatTrigger(&buf, .{
+        .mods = .{ .alt = true },
+        .key = .{ .physical = .page_up },
+    }));
+    try std.testing.expectEqualStrings("Win+Enter", formatTrigger(&buf, .{
+        .mods = .{ .super = true },
+        .key = .{ .physical = .enter },
+    }));
 }
