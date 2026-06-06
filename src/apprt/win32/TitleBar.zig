@@ -292,6 +292,8 @@ extern "gdiplus" fn GdipFillPath(graphics: *anyopaque, brush: *anyopaque, path: 
 
 const smoothing_antialias: c_int = 4;
 
+// GdiplusShutdown is intentionally never called; GDI+ is a process-lifetime
+// resource and there is no clean shutdown point in a GUI application.
 var gdiplus_token: usize = 0;
 
 fn ensureGdiplus() void {
@@ -330,6 +332,8 @@ fn ensureFonts(self: *TitleBar, dpi: u32) void {
     if (self.fonts_dpi == dpi and self.text_font != null) return;
     if (self.text_font) |f| _ = sys.DeleteObject(f);
     if (self.glyph_font) |f| _ = sys.DeleteObject(f);
+    // If CreateFontW fails, the field stays null and SelectObject with null
+    // is a no-op — the code degrades gracefully to the default GDI font.
     self.text_font = sys.CreateFontW(
         -s(dpi, 12), // ~9pt UI text
         0,
@@ -465,30 +469,49 @@ pub fn paint(self: *TitleBar, info: PaintInfo) void {
             text_flags,
         );
     } else {
-        // Tab shapes need GDI+ (anti-aliased round tops).
-        var graphics: *anyopaque = undefined;
-        const has_g = GdipCreateFromHDC(mem_dc, &graphics) == 0;
-        defer if (has_g) {
-            _ = GdipDeleteGraphics(graphics);
-        };
-        if (has_g) _ = GdipSetSmoothingMode(graphics, smoothing_antialias);
-
-        for (info.titles, 0..) |title, i| {
-            const tr = layout.tabRect(i);
-            const is_current = i == info.current;
-            const is_hover = self.hover.eql(.{ .tab = i }) or self.hover.eql(.{ .tab_close = i });
-
-            if (has_g) {
+        // Pass 1: tab shapes via GDI+. The Graphics object may batch
+        // its drawing, so it must be fully deleted (committing the
+        // batch to the DC) before any GDI text below — otherwise the
+        // fills can paint over the labels.
+        gdip: {
+            var graphics: *anyopaque = undefined;
+            if (GdipCreateFromHDC(mem_dc, &graphics) != 0) break :gdip;
+            defer _ = GdipDeleteGraphics(graphics);
+            _ = GdipSetSmoothingMode(graphics, smoothing_antialias);
+            for (info.titles, 0..) |_, i| {
+                const tr = layout.tabRect(i);
+                const is_current = i == info.current;
+                const is_hover = self.hover.eql(.{ .tab = i }) or self.hover.eql(.{ .tab_close = i });
                 if (is_current) {
                     fillRoundedTop(graphics, pal.active_tab.argb(), tr, layout.radius);
                 } else if (is_hover) {
                     fillRoundedTop(graphics, pal.hover_tab.argb(), tr, layout.radius);
                 }
             }
+        }
 
-            // "N · title", ellipsized.
+        // Pass 2: text/glyphs via GDI (ClearType). The GDI+ Graphics
+        // object has already been deleted above, committing all shapes.
+        for (info.titles, 0..) |title, i| {
+            const tr = layout.tabRect(i);
+            const is_current = i == info.current;
+            const is_hover = self.hover.eql(.{ .tab = i }) or self.hover.eql(.{ .tab_close = i });
+
+            // "N · title", ellipsized. On overflow, truncate the title
+            // to fit, backing off to a clean UTF-8 codepoint boundary.
             var label_buf: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(&label_buf, "{d} · {s}", .{ i + 1, title }) catch title;
+            const label = std.fmt.bufPrint(&label_buf, "{d} · {s}", .{ i + 1, title }) catch blk: {
+                // Title too long for the buffer: truncate it. DrawTextW
+                // adds the visual ellipsis, this only bounds the bytes.
+                const prefix = std.fmt.bufPrint(&label_buf, "{d} · ", .{i + 1}) catch break :blk title[0..@min(title.len, label_buf.len)];
+                const room = label_buf.len - prefix.len;
+                var cut = @min(title.len, room);
+                // Back off to a clean UTF-8 codepoint boundary so we
+                // don't hand a truncated multi-byte sequence to DrawTextW.
+                while (cut > 0 and (title[cut] & 0xC0) == 0x80) cut -= 1;
+                @memcpy(label_buf[prefix.len..][0..cut], title[0..cut]);
+                break :blk label_buf[0 .. prefix.len + cut];
+            };
 
             const close_r = layout.tabCloseRect(i);
             const show_close = is_current or is_hover;
