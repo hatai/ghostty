@@ -12,6 +12,7 @@ const SplitTree = @import("SplitTree.zig");
 const sys = @import("sys.zig");
 
 const App = @import("App.zig");
+const TitleBar = @import("TitleBar.zig");
 
 const HWND = sys.HWND;
 const RECT = sys.RECT;
@@ -25,6 +26,7 @@ const LRESULT = sys.LRESULT;
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_TABSTOP: u32 = 0x00010000;
+const WS_CLIPCHILDREN: u32 = 0x02000000;
 const TCS_FIXEDWIDTH: u32 = 0x0400;
 const WM_NOTIFY: UINT = 0x004E;
 const WM_SETFONT: UINT = 0x0030;
@@ -128,6 +130,7 @@ const TabState = struct {
 app: *App,
 hwnd: ?HWND = null,
 tab_hwnd: ?HWND = null,
+titlebar: TitleBar = .{},
 primary_surface: *Surface,
 tree: ?SplitTree = null,
 focused_surface: ?*Surface = null,
@@ -160,6 +163,7 @@ pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
     errdefer {
         if (self.hwnd) |h| _ = sys.DestroyWindow(h);
     }
+    self.setupCustomFrame();
 
     try self.createTabControl();
     _ = sys.SetWindowLongPtrW(self.hwnd.?, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -224,7 +228,7 @@ fn createHwnd(self: *Window, title_override: ?[:0]const u8) !void {
         if (self.quick_terminal) @intCast(sys.WS_EX_TOPMOST) else 0,
         class_name,
         if (title) |v| v.ptr else std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
-        if (self.quick_terminal) sys.WS_OVERLAPPEDWINDOW & ~sys.WS_CAPTION_BIT else sys.WS_OVERLAPPEDWINDOW,
+        (if (self.quick_terminal) sys.WS_OVERLAPPEDWINDOW & ~sys.WS_CAPTION_BIT else sys.WS_OVERLAPPEDWINDOW) | WS_CLIPCHILDREN,
         sys.CW_USEDEFAULT,
         sys.CW_USEDEFAULT,
         900,
@@ -237,6 +241,37 @@ fn createHwnd(self: *Window, title_override: ?[:0]const u8) !void {
     if (self.hwnd == null) return error.Win32Error;
     _ = sys.ShowWindow(self.hwnd.?, sys.SW_SHOWNORMAL);
     _ = sys.UpdateWindow(self.hwnd.?);
+}
+
+/// Switch the window to a custom frame: the standard caption is
+/// removed (WM_NCCALCSIZE) and we draw our own titlebar with
+/// integrated tabs in the top strip of the client area. Quick
+/// terminal windows keep their existing frameless style.
+fn setupCustomFrame(self: *Window) void {
+    if (self.quick_terminal) return;
+    const hwnd = self.hwnd orelse return;
+
+    // Hint dark mode so the system menu / transition chrome matches.
+    const bg = self.app.config.background;
+    const dark: i32 = if ((TitleBar.Rgb{ .r = bg.r, .g = bg.g, .b = bg.b }).isDark()) 1 else 0;
+    _ = sys.DwmSetWindowAttribute(
+        hwnd,
+        sys.DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark,
+        @sizeOf(i32),
+    );
+
+    // 1px top inset keeps the DWM drop shadow & Win11 rounded corners.
+    const margins: sys.MARGINS = .{
+        .cxLeftWidth = 0,
+        .cxRightWidth = 0,
+        .cyTopHeight = 1,
+        .cyBottomHeight = 0,
+    };
+    _ = sys.DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+    // Force WM_NCCALCSIZE so the new frame takes effect.
+    _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | sys.SWP_FRAMECHANGED);
 }
 
 fn createTabControl(self: *Window) !void {
@@ -600,6 +635,42 @@ fn updateTabVisibility(self: *Window) void {
 
 fn tabClientHeight(self: *Window) i32 {
     return if (self.tabs.items.len > 1) TAB_HEIGHT else 0;
+}
+
+/// Height of the custom titlebar strip in client pixels. Zero when
+/// the strip is not shown (quick terminal & fullscreen keep their
+/// existing chrome-less behavior).
+fn titleBarHeight(self: *Window) i32 {
+    if (self.quick_terminal or self.fullscreen.active) return 0;
+    const hwnd = self.hwnd orelse return 0;
+    return TitleBar.barHeight(sys.GetDpiForWindow(hwnd));
+}
+
+/// Height of the invisible top resize border (standard frame metric).
+fn topResizeBorder(self: *Window) i32 {
+    const hwnd = self.hwnd orelse return 8;
+    const dpi = sys.GetDpiForWindow(hwnd);
+    return sys.GetSystemMetricsForDpi(sys.SM_CYFRAME, dpi) +
+        sys.GetSystemMetricsForDpi(sys.SM_CXPADDEDBORDER, dpi);
+}
+
+fn invalidateTitleBar(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var rect: RECT = std.mem.zeroes(RECT);
+    if (sys.GetClientRect(hwnd, &rect) == 0) return;
+    rect.bottom = self.titleBarHeight();
+    _ = sys.InvalidateRect(hwnd, &rect, 0);
+}
+
+/// Palette derived fresh from the config every time so a config
+/// reload is picked up automatically on the next paint.
+fn themePalette(self: *Window) TitleBar.Palette {
+    const bg = self.app.config.background;
+    const fg = self.app.config.foreground;
+    return TitleBar.Palette.derive(
+        .{ .r = bg.r, .g = bg.g, .b = bg.b },
+        .{ .r = fg.r, .g = fg.g, .b = fg.b },
+    );
 }
 
 fn tabLeaves(tab: *TabState, buf: []*Surface) []const *Surface {
@@ -1160,8 +1231,69 @@ fn containsLeaf(node: *SplitTree.Node, target: *Surface) bool {
 }
 
 pub fn handleTopLevelMessage(self: *Window, msg: UINT, wparam: WPARAM, lparam: LPARAM) ?LRESULT {
-    _ = wparam;
     switch (msg) {
+        sys.WM_NCCALCSIZE => {
+            // Remove the standard caption: keep the client top edge at
+            // the window top. Resize borders on the other 3 sides stay.
+            if (wparam == 0 or self.quick_terminal or self.fullscreen.active) return null;
+            const hwnd = self.hwnd orelse return null;
+            const params: *sys.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const original_top = params.rgrc[0].top;
+            _ = sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+            params.rgrc[0].top = original_top;
+            if (sys.IsZoomed(hwnd) != 0) {
+                // When maximized the window hangs off-screen by the
+                // frame size; push the client down so the strip is
+                // fully visible.
+                params.rgrc[0].top += self.topResizeBorder();
+            }
+            return 0;
+        },
+        sys.WM_NCHITTEST => {
+            if (self.quick_terminal or self.fullscreen.active) return null;
+            const hwnd = self.hwnd orelse return null;
+            const def = sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (def != sys.HTCLIENT) return def;
+
+            var pt: sys.POINT = .{
+                .x = @as(i16, @truncate(lparam & 0xFFFF)),
+                .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+            };
+            _ = sys.ScreenToClient(hwnd, &pt);
+
+            const maximized = sys.IsZoomed(hwnd) != 0;
+            if (!maximized and pt.y < self.topResizeBorder()) return sys.HTTOP;
+
+            const bar_h = self.titleBarHeight();
+            if (pt.y < bar_h) {
+                var rect: RECT = std.mem.zeroes(RECT);
+                _ = sys.GetClientRect(hwnd, &rect);
+                const layout = TitleBar.Layout.compute(
+                    sys.GetDpiForWindow(hwnd),
+                    rect.right - rect.left,
+                    @max(self.tabs.items.len, 1),
+                );
+                return switch (layout.hitTest(pt.x, pt.y, maximized)) {
+                    .caption => sys.HTCAPTION,
+                    // Tabs and buttons are handled by our own client
+                    // mouse handlers.
+                    else => sys.HTCLIENT,
+                };
+            }
+            return sys.HTCLIENT;
+        },
+        sys.WM_ACTIVATE => {
+            self.titlebar.window_active = (wparam & 0xFFFF) != 0;
+            self.invalidateTitleBar();
+            return null;
+        },
+        sys.WM_SETTEXT => {
+            // Window title is drawn in the strip when a single tab is
+            // open; repaint after the default proc stores the text.
+            self.invalidateTitleBar();
+            return null;
+        },
+        sys.WM_ERASEBKGND => return 1,
         WM_NOTIFY => {
             const hdr: *const NMHDR = @ptrFromInt(@as(usize, @bitCast(lparam)));
             if (self.tab_hwnd != null and hdr.hwndFrom == self.tab_hwnd.? and hdr.code == TCN_SELCHANGE) {
