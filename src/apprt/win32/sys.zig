@@ -236,3 +236,20 @@ pub extern "gdi32" fn SetTextColor(hdc: HDC, color: u32) callconv(.winapi) u32;
 pub extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
 pub extern "user32" fn FillRect(hDC: HDC, lprc: *const RECT, hbr: ?*anyopaque) callconv(.winapi) c_int;
 pub extern "gdi32" fn CreateFontW(cHeight: c_int, cWidth: c_int, cEscapement: c_int, cOrientation: c_int, cWeight: c_int, bItalic: DWORD, bUnderline: DWORD, bStrikeOut: DWORD, iCharSet: DWORD, iOutPrecision: DWORD, iClipPrecision: DWORD, iQuality: DWORD, iPitchAndFamily: DWORD, pszFaceName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+
+// ---------------------------------------------------------------------------
+// Command palette support
+// ---------------------------------------------------------------------------
+
+// Win11 window corner rounding & border color (no-ops on Win10).
+pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWORD = 33;
+pub const DWMWA_BORDER_COLOR: DWORD = 34;
+pub const DWMWCP_ROUND: i32 = 2;
+
+// Text measurement
+pub const SIZE = extern struct { cx: i32, cy: i32 };
+pub extern "gdi32" fn GetTextExtentPoint32W(hdc: HDC, lpString: [*]const u16, c: c_int, psizl: *SIZE) callconv(.winapi) BOOL;
+
+// Visual styles (dark scrollbars via the undocumented-but-stable
+// "DarkMode_Explorer" subclass; failure is harmless).
+pub extern "uxtheme" fn SetWindowTheme(hwnd: HWND, pszSubAppName: ?[*:0]const u16, pszSubIdList: ?[*:0]const u16) callconv(.winapi) i32;

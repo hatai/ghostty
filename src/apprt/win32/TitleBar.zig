@@ -110,6 +110,12 @@ pub const Palette = struct {
     text_inactive: Rgb,
     btn_hover: Rgb,
     close_hover: Rgb,
+    /// Selected-row fill for list-style popups (command palette).
+    selection: Rgb,
+    /// Raised surface (e.g. keycap chips) on top of bar_bg.
+    surface: Rgb,
+    /// Subtle outline/separator color.
+    outline: Rgb,
 
     pub fn derive(bg: Rgb, fg: Rgb) Palette {
         const bar = darken(bg, 25);
@@ -122,6 +128,9 @@ pub const Palette = struct {
             .btn_hover = lighten(bar, 10),
             // Windows-standard caption close red.
             .close_hover = .{ .r = 0xE8, .g = 0x11, .b = 0x23 },
+            .selection = lighten(bar, 14),
+            .surface = lighten(bar, 6),
+            .outline = lighten(bar, 22),
         };
     }
 
@@ -326,6 +335,39 @@ fn fillRoundedTop(g: *anyopaque, color: u32, r: RECT, radius: i32) void {
     _ = GdipAddPathLine(path, x + w, y + h, x, y + h);
     _ = GdipClosePathFigure(path);
     _ = GdipFillPath(g, brush, path);
+}
+
+/// Fill a fully-rounded rectangle with GDI+ (anti-aliased). Creates a
+/// transient Graphics on the DC and deletes it before returning, which
+/// commits the GDI+ batch — callers may freely mix subsequent GDI
+/// drawing on the same DC (same rule as the titlebar two-pass paint).
+pub fn fillRoundedRect(dc: sys.HDC, color: u32, r: RECT, radius: i32) void {
+    ensureGdiplus();
+    var graphics: *anyopaque = undefined;
+    if (GdipCreateFromHDC(dc, &graphics) != 0) return;
+    defer _ = GdipDeleteGraphics(graphics);
+    _ = GdipSetSmoothingMode(graphics, smoothing_antialias);
+
+    var brush: *anyopaque = undefined;
+    if (GdipCreateSolidFill(color, &brush) != 0) return;
+    defer _ = GdipDeleteBrush(brush);
+
+    var path: *anyopaque = undefined;
+    if (GdipCreatePath(0, &path) != 0) return;
+    defer _ = GdipDeletePath(path);
+
+    const x: f32 = @floatFromInt(r.left);
+    const y: f32 = @floatFromInt(r.top);
+    const w: f32 = @floatFromInt(r.right - r.left);
+    const h: f32 = @floatFromInt(r.bottom - r.top);
+    const d: f32 = @floatFromInt(radius * 2);
+
+    _ = GdipAddPathArc(path, x, y, d, d, 180, 90); // top-left
+    _ = GdipAddPathArc(path, x + w - d, y, d, d, 270, 90); // top-right
+    _ = GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0, 90); // bottom-right
+    _ = GdipAddPathArc(path, x, y + h - d, d, d, 90, 90); // bottom-left
+    _ = GdipClosePathFigure(path);
+    _ = GdipFillPath(graphics, brush, path);
 }
 
 fn ensureFonts(self: *TitleBar, dpi: u32) void {
@@ -605,6 +647,9 @@ test "palette derives theme-relative colors" {
     try std.testing.expect(p.text_inactive.r < fg.r and p.text_inactive.r > bg.r);
     try std.testing.expect(bg.isDark());
     try std.testing.expect(!fg.isDark());
+    // popup-selection colors sit above the bar background
+    try std.testing.expect(p.selection.r > p.bar_bg.r);
+    try std.testing.expect(p.outline.r > p.surface.r);
 }
 
 test "layout hit testing" {
