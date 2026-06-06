@@ -583,6 +583,9 @@ pub fn performAction(
                 log.err("failed to update config: {}", .{err});
                 return false;
             };
+            // The titlebar colors derive from the config; repaint so a
+            // changed theme shows up without waiting for a resize.
+            for (self.windows.items) |w| w.invalidateTitleBar();
             return true;
         },
         .config_change => return true,

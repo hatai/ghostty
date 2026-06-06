@@ -473,6 +473,8 @@ fn insertTab(self: *Window, raw_index: usize, opts: CreateOptions, select: bool)
         self.current_tab += 1;
     }
 
+    // Tab indices shifted; stale hover would highlight the wrong tab.
+    self.titlebar.hover = .none;
     self.invalidateTitleBar();
 
     if (select or self.tabs.items.len == 1) {
@@ -555,7 +557,7 @@ fn topResizeBorder(self: *Window) i32 {
         sys.GetSystemMetricsForDpi(sys.SM_CXPADDEDBORDER, dpi);
 }
 
-fn invalidateTitleBar(self: *Window) void {
+pub fn invalidateTitleBar(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     var rect: RECT = std.mem.zeroes(RECT);
     if (sys.GetClientRect(hwnd, &rect) == 0) return;
@@ -661,6 +663,7 @@ fn closeTabAt(self: *Window, index: usize) void {
         self.showTabSurfaces(&self.tabs.items[self.current_tab]);
     }
 
+    self.titlebar.hover = .none;
     self.invalidateTitleBar();
     self.activateTab(self.current_tab) catch {};
 }
@@ -696,6 +699,7 @@ fn closeEmptyTabAt(self: *Window, index: usize) void {
         self.showTabSurfaces(&self.tabs.items[self.current_tab]);
     }
 
+    self.titlebar.hover = .none;
     self.invalidateTitleBar();
     self.activateTab(self.current_tab) catch {};
 }
@@ -733,6 +737,7 @@ pub fn moveTab(self: *Window, amount: isize) bool {
     const moved = self.tabs.orderedRemove(old_idx);
     self.tabs.insert(self.app.alloc, new_idx, moved) catch return false;
     self.current_tab = new_idx;
+    self.titlebar.hover = .none;
     self.invalidateTitleBar();
     self.activateTab(new_idx) catch {};
     return true;
