@@ -441,6 +441,22 @@ pub fn closeWindow(self: *App, window: *Window) void {
         self.command_palette.target_window = null;
     }
 
+    // Same lifetime hardening for the other popups: drop their
+    // window pointers before the window is freed.
+    if (self.prompt_dialog_initialized and
+        self.prompt_dialog.target_window == window)
+    {
+        self.prompt_dialog.close();
+        self.prompt_dialog.target_window = null;
+    }
+    if (self.search_panel_initialized and
+        self.search_panel.target_window == window)
+    {
+        // No end_search: the surface is being torn down with the window.
+        self.search_panel.close(false);
+        self.search_panel.target_window = null;
+    }
+
     window.deinit();
     self.alloc.destroy(window);
 

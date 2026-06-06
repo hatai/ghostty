@@ -6,6 +6,8 @@ const CoreSurface = @import("../../Surface.zig");
 const sys = @import("sys.zig");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
+const popup_style = @import("popup_style.zig");
+const PopupTheme = popup_style.PopupTheme;
 
 const HWND = sys.HWND;
 const UINT = sys.UINT;
@@ -15,13 +17,10 @@ const LRESULT = sys.LRESULT;
 const DWORD = sys.DWORD;
 
 const WS_POPUP: u32 = 0x80000000;
-const WS_BORDER: u32 = 0x00800000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_CHILD: u32 = 0x40000000;
-const WS_TABSTOP: u32 = 0x00010000;
 const WS_EX_TOOLWINDOW: u32 = 0x00000080;
 const ES_AUTOHSCROLL: u32 = 0x0080;
-const BS_DEFPUSHBUTTON: u32 = 0x00000001;
 
 const WM_COMMAND: UINT = 0x0111;
 const WM_CLOSE: UINT = 0x0010;
@@ -32,11 +31,18 @@ const EN_CHANGE: u16 = 0x0300;
 
 const VK_ESCAPE: WPARAM = 0x1B;
 
+const WM_CTLCOLOREDIT: UINT = 0x0133;
+const VK_RETURN: WPARAM = 0x0D;
+const VK_SHIFT: c_int = 0x10;
+
+// Layout metrics in 96-dpi design units.
+const panel_w: i32 = 460;
+const input_top: i32 = 12;
+const input_h: i32 = 36;
+const status_h: i32 = 30;
+const margin: i32 = 14;
+
 const EDIT_ID: usize = 200;
-const PREV_ID: usize = 201;
-const NEXT_ID: usize = 202;
-const CLOSE_ID: usize = 203;
-const STATUS_ID: usize = 204;
 
 extern "user32" fn CreateWindowExW(dwExStyle: DWORD, lpClassName: ?[*:0]const u16, lpWindowName: ?[*:0]const u16, dwStyle: DWORD, x: i32, y: i32, nWidth: i32, nHeight: i32, hWndParent: ?HWND, hMenu: ?*anyopaque, hInstance: ?*anyopaque, lpParam: ?*anyopaque) callconv(.winapi) ?HWND;
 extern "user32" fn SendMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
@@ -48,13 +54,11 @@ extern "user32" fn GetDlgItemTextW(hDlg: HWND, nIDDlgItem: c_int, lpString: [*]u
 extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: [*:0]const u16) callconv(.winapi) sys.BOOL;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) isize;
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: isize) callconv(.winapi) isize;
-extern "gdi32" fn CreateFontW(cHeight: c_int, cWidth: c_int, cEscapement: c_int, cOrientation: c_int, cWeight: c_int, bItalic: DWORD, bUnderline: DWORD, bStrikeOut: DWORD, iCharSet: DWORD, iOutPrecision: DWORD, iClipPrecision: DWORD, iQuality: DWORD, iPitchAndFamily: DWORD, pszFaceName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
-
 alloc: Allocator,
 app: *App,
 hwnd: ?HWND = null,
 edit_hwnd: ?HWND = null,
-status_hwnd: ?HWND = null,
+theme: ?PopupTheme = null,
 target_window: ?*Window = null,
 target_surface: ?*CoreSurface = null,
 opening: bool = false,
@@ -66,7 +70,9 @@ pub fn init(alloc: Allocator, app: *App) Self {
 }
 
 pub fn deinit(self: *Self) void {
-    if (self.hwnd) |h| _ = DestroyWindow(h);
+    // No end_search notification at app teardown: the surfaces are
+    // being torn down anyway.
+    self.close(false);
 }
 
 pub fn open(self: *Self, window: *Window, surface: *CoreSurface, initial: [:0]const u8) !void {
@@ -78,29 +84,46 @@ pub fn open(self: *Self, window: *Window, surface: *CoreSurface, initial: [:0]co
 
         try registerClass();
         const parent = window.hwnd orelse return error.NoParent;
+        var theme = PopupTheme.init(parent, self.app.config);
+        errdefer theme.deinit();
+
         var parent_rect: sys.RECT = std.mem.zeroes(sys.RECT);
         _ = GetWindowRect(parent, &parent_rect);
-        const width: i32 = 460;
-        const height: i32 = 120;
+        const width: i32 = theme.s(panel_w);
+        const height: i32 = theme.s(input_top + input_h + status_h);
         const x = parent_rect.left + @divTrunc((parent_rect.right - parent_rect.left) - width, 2);
         const y = parent_rect.top + 20;
         const hinstance = sys.GetModuleHandleW(null);
-        self.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, std.unicode.utf8ToUtf16LeStringLiteral("GhosttySearchPanel"), std.unicode.utf8ToUtf16LeStringLiteral("Search"), WS_POPUP | WS_BORDER, x, y, width, height, parent, null, hinstance, null) orelse return error.Win32Error;
+        self.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, std.unicode.utf8ToUtf16LeStringLiteral("GhosttySearchPanel"), std.unicode.utf8ToUtf16LeStringLiteral("Search"), WS_POPUP, x, y, width, height, parent, null, hinstance, null) orelse return error.Win32Error;
         errdefer self.close(false);
         _ = SetWindowLongPtrW(self.hwnd.?, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-        self.edit_hwnd = CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 10, 10, width - 20, 28, self.hwnd, @ptrFromInt(EDIT_ID), hinstance, null) orelse return error.Win32Error;
-        self.status_hwnd = CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral(""), WS_CHILD | WS_VISIBLE, 10, 45, 200, 20, self.hwnd, @ptrFromInt(STATUS_ID), hinstance, null) orelse return error.Win32Error;
-        const button_class = std.unicode.utf8ToUtf16LeStringLiteral("BUTTON");
-        _ = CreateWindowExW(0, button_class, std.unicode.utf8ToUtf16LeStringLiteral("Prev"), WS_CHILD | WS_VISIBLE | WS_TABSTOP, width - 210, 70, 60, 28, self.hwnd, @ptrFromInt(PREV_ID), hinstance, null) orelse return error.Win32Error;
-        _ = CreateWindowExW(0, button_class, std.unicode.utf8ToUtf16LeStringLiteral("Next"), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, width - 145, 70, 60, 28, self.hwnd, @ptrFromInt(NEXT_ID), hinstance, null) orelse return error.Win32Error;
-        _ = CreateWindowExW(0, button_class, std.unicode.utf8ToUtf16LeStringLiteral("Close"), WS_CHILD | WS_VISIBLE | WS_TABSTOP, width - 80, 70, 60, 28, self.hwnd, @ptrFromInt(CLOSE_ID), hinstance, null) orelse return error.Win32Error;
+        self.theme = theme;
+        theme.bg_brush = null; // ownership moved; silence the errdefer
+        theme.input_brush = null;
+        theme.font_main = null;
+        theme.font_small = null;
 
-        if (ui_font == null) ui_font = CreateFontW(-18, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"));
-        if (ui_font) |font| {
-            if (self.edit_hwnd) |eh| _ = SendMessageW(eh, WM_SETFONT, @intFromPtr(font), 1);
-            if (self.status_hwnd) |sh| _ = SendMessageW(sh, WM_SETFONT, @intFromPtr(font), 1);
-        }
+        self.theme.?.applyChrome(self.hwnd.?);
+
+        const t = &self.theme.?;
+        const edit_h = t.s(20);
+        self.edit_hwnd = CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("EDIT"),
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            t.s(margin) + t.s(8),
+            t.s(input_top) + @divTrunc(t.s(input_h) - edit_h, 2),
+            width - 2 * t.s(margin) - 2 * t.s(8),
+            edit_h,
+            self.hwnd,
+            @ptrFromInt(EDIT_ID),
+            hinstance,
+            null,
+        ) orelse return error.Win32Error;
+        if (t.font_main) |font| _ = SendMessageW(self.edit_hwnd.?, WM_SETFONT, @intFromPtr(font), 1);
+
         _ = ShowWindow(self.hwnd.?, 1);
     } else {
         self.target_window = window;
@@ -123,6 +146,14 @@ pub fn preTranslateMessage(self: *Self, message: UINT, hwnd: HWND, wparam: WPARA
             self.close(true);
             return true;
         },
+        VK_RETURN => {
+            // Enter = next match, Shift+Enter = previous match.
+            if (sys.GetKeyState(VK_SHIFT) < 0)
+                self.navigate(.previous)
+            else
+                self.navigate(.next);
+            return true;
+        },
         else => return false,
     }
 }
@@ -136,7 +167,8 @@ pub fn close(self: *Self, notify_core: bool) void {
     if (self.hwnd) |h| _ = DestroyWindow(h);
     self.hwnd = null;
     self.edit_hwnd = null;
-    self.status_hwnd = null;
+    if (self.theme) |*t| t.deinit();
+    self.theme = null;
     if (self.target_window) |w| {
         if (w.focused_surface) |s| _ = SetFocus(s.hwnd);
     }
@@ -162,17 +194,7 @@ pub fn setSearchSelected(self: *Self, selected: ?usize) void {
 }
 
 fn updateStatus(self: *Self) void {
-    const status = if (self.total) |t|
-        if (self.selected) |s|
-            std.fmt.allocPrint(self.alloc, "{d}/{d}", .{ s + 1, t }) catch return
-        else
-            std.fmt.allocPrint(self.alloc, "0/{d}", .{t}) catch return
-    else
-        std.fmt.allocPrint(self.alloc, "", .{}) catch return;
-    defer self.alloc.free(status);
-    const w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, status) catch return;
-    defer self.alloc.free(w);
-    if (self.status_hwnd) |sh| _ = SetWindowTextW(sh, w.ptr);
+    if (self.hwnd) |h| _ = sys.InvalidateRect(h, null, 0);
 }
 
 fn emitSearchChanged(self: *Self) void {
@@ -199,20 +221,24 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
     if (ptr == 0) return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
     const self: *Self = @ptrFromInt(@as(usize, @bitCast(ptr)));
     switch (msg) {
+        WM_CTLCOLOREDIT => {
+            const t = &(self.theme orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam));
+            const hdc: ?*anyopaque = @ptrFromInt(wparam);
+            const brush = t.ctlColorInput(hdc) orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+            return @bitCast(@intFromPtr(brush));
+        },
+        sys.WM_ERASEBKGND => {
+            const t = &(self.theme orelse return 0);
+            return t.eraseBkgnd(hwnd, wparam);
+        },
+        sys.WM_PAINT => {
+            self.paint(hwnd);
+            return 0;
+        },
         WM_COMMAND => {
             const id: usize = wparam & 0xFFFF;
             const code: u16 = @truncate((wparam >> 16) & 0xFFFF);
-            switch (id) {
-                EDIT_ID => if (code == EN_CHANGE) self.emitSearchChanged(),
-                PREV_ID => {
-                    self.navigate(.previous);
-                },
-                NEXT_ID => {
-                    self.navigate(.next);
-                },
-                CLOSE_ID => self.close(true),
-                else => {},
-            }
+            if (id == EDIT_ID and code == EN_CHANGE) self.emitSearchChanged();
             return 0;
         },
         WM_KEYDOWN => if (wparam == VK_ESCAPE) {
@@ -232,8 +258,56 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
     return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
+fn paint(self: *Self, hwnd: HWND) void {
+    var ps: sys.PAINTSTRUCT = std.mem.zeroes(sys.PAINTSTRUCT);
+    const hdc = sys.BeginPaint(hwnd, &ps);
+    defer _ = sys.EndPaint(hwnd, &ps);
+    const t = &(self.theme orelse return);
+
+    var rc: sys.RECT = std.mem.zeroes(sys.RECT);
+    _ = sys.GetClientRect(hwnd, &rc);
+
+    // Rounded input field.
+    t.drawInputBox(hdc, .{
+        .left = t.s(margin),
+        .top = t.s(input_top),
+        .right = rc.right - t.s(margin),
+        .bottom = t.s(input_top) + t.s(input_h),
+    });
+
+    const bottom_top = t.s(input_top) + t.s(input_h);
+
+    // Match status on the left ("3 / 12", empty until known).
+    const old_font = sys.SelectObject(hdc, t.font_small);
+    defer _ = sys.SelectObject(hdc, old_font);
+    var status_buf: [32]u8 = undefined;
+    const status: []const u8 = if (self.total) |total| blk: {
+        const sel_1based = if (self.selected) |sel| sel + 1 else 0;
+        break :blk std.fmt.bufPrint(&status_buf, "{d} / {d}", .{ sel_1based, total }) catch "";
+    } else "";
+    t.drawLabel(
+        hdc,
+        .{ .left = t.s(margin) + t.s(4), .top = bottom_top, .right = @divTrunc(rc.right, 2), .bottom = rc.bottom },
+        status,
+        t.pal.text_inactive.colorref(),
+        sys.DT_SINGLELINE | sys.DT_VCENTER | sys.DT_NOPREFIX,
+    );
+
+    // Key hints, right-aligned.
+    const hints: []const popup_style.Hint = &.{
+        .{ .key = "Enter", .label = "Next" },
+        .{ .key = "Shift+Enter", .label = "Prev" },
+        .{ .key = "Esc", .label = "Close" },
+    };
+    const hints_w = t.measureHints(hdc, hints);
+    t.drawHints(
+        hdc,
+        .{ .left = rc.right - t.s(margin) - hints_w, .top = bottom_top, .right = rc.right - t.s(margin), .bottom = rc.bottom },
+        hints,
+    );
+}
+
 var class_registered = false;
-var ui_font: ?*anyopaque = null;
 
 fn registerClass() !void {
     if (class_registered) return;
