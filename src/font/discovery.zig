@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const fontconfig = @import("fontconfig");
+const freetype = @import("freetype");
 const macos = @import("macos");
 const opentype = @import("opentype.zig");
 const options = @import("main.zig").options;
@@ -900,6 +901,45 @@ pub const CoreText = struct {
 pub const Windows = struct {
     lib: Library,
 
+    /// A known-good system font file paired with the family name used
+    /// to select the right subfamily within it (important for .ttc
+    /// collections, e.g. msgothic.ttc contains the monospaced
+    /// "MS Gothic" alongside the proportional "MS PGothic" and
+    /// "MS UI Gothic").
+    const CuratedFont = struct {
+        file: []const u8,
+        family: [:0]const u8,
+    };
+
+    /// Curated system fonts probed in order before falling back to a
+    /// full directory scan. Without this, a codepoint fallback query
+    /// picks the alphabetically-first font file containing the
+    /// codepoint, which on a Japanese system tends to be a Bold face
+    /// (BIZ-UDGothicB.ttc) or a proportional variant — producing
+    /// mixed-weight, badly-spaced CJK text. The order prefers
+    /// monospaced/dual-width regular CJK faces. Files missing on a
+    /// given system (e.g. Japanese fonts on a non-Japanese install)
+    /// are silently skipped.
+    const curated_fonts = [_]CuratedFont{
+        // Japanese (monospaced/dual-width, regular weight first)
+        .{ .file = "BIZ-UDGothicR.ttc", .family = "BIZ UDGothic" },
+        .{ .file = "YuGothM.ttc", .family = "Yu Gothic Medium" },
+        .{ .file = "meiryo.ttc", .family = "Meiryo" },
+        .{ .file = "msgothic.ttc", .family = "MS Gothic" },
+        .{ .file = "msmincho.ttc", .family = "MS Mincho" },
+        // Chinese
+        .{ .file = "msyh.ttc", .family = "Microsoft YaHei" },
+        .{ .file = "simsun.ttc", .family = "SimSun" },
+        // Korean
+        .{ .file = "malgun.ttf", .family = "Malgun Gothic" },
+        // Emoji (must precede the Latin text fonts so emoji
+        // presentation codepoints resolve to a color face)
+        .{ .file = "seguiemj.ttf", .family = "Segoe UI Emoji" },
+        // Latin/symbol catch-alls
+        .{ .file = "segoeui.ttf", .family = "Segoe UI" },
+        .{ .file = "arial.ttf", .family = "Arial" },
+    };
+
     pub fn init(lib: Library) Windows {
         return .{ .lib = lib };
     }
@@ -918,7 +958,8 @@ pub const Windows = struct {
             .lib = self.lib,
             .desc = desc,
             .variations = desc.variations,
-            .state = .system,
+            .state = .curated,
+            .curated_index = 0,
             .dir = null,
             .iter = null,
             .system_path = null,
@@ -942,12 +983,13 @@ pub const Windows = struct {
         desc: Descriptor,
         variations: []const Variation,
         state: State,
+        curated_index: usize,
         dir: ?std.fs.Dir,
         iter: ?std.fs.Dir.Iterator,
         system_path: ?[:0]const u8,
         user_path: ?[:0]const u8,
 
-        const State = enum { system, user, done };
+        const State = enum { curated, system, user, done };
 
         pub fn deinit(self: *DiscoverIterator) void {
             if (self.dir) |*d| d.close();
@@ -958,9 +1000,26 @@ pub const Windows = struct {
 
         pub fn next(self: *DiscoverIterator) !?DeferredFace {
             while (true) {
+                // Probe the curated font list before any directory scan.
+                // We stream one candidate per call so the caller can
+                // reject a face (e.g. presentation mismatch) and pull
+                // the next one.
+                if (self.state == .curated) {
+                    if (self.curated_index >= curated_fonts.len) {
+                        self.state = .system;
+                        continue;
+                    }
+                    const curated = curated_fonts[self.curated_index];
+                    self.curated_index += 1;
+                    if (try self.tryMatchCurated(curated)) |face| return face;
+                    continue;
+                }
+
                 // Ensure we have a directory iterator for the current state.
                 if (self.iter == null) {
                     switch (self.state) {
+                        // Handled above before this branch.
+                        .curated => unreachable,
                         .system => {
                             const path = self.systemFontsPath() orelse {
                                 self.state = .user;
@@ -1001,6 +1060,7 @@ pub const Windows = struct {
                     self.dir = null;
                     self.iter = null;
                     self.state = switch (self.state) {
+                        .curated => unreachable,
                         .system => .user,
                         .user => .done,
                         .done => .done,
@@ -1052,6 +1112,7 @@ pub const Windows = struct {
             name: []const u8,
         ) !?DeferredFace {
             const dir_path = switch (self.state) {
+                .curated => unreachable,
                 .system => self.system_path.?,
                 .user => self.user_path.?,
                 .done => return null,
@@ -1087,15 +1148,90 @@ pub const Windows = struct {
             return null;
         }
 
+        /// Try to match a curated font entry. Returns null (and never
+        /// errors) when the file doesn't exist on this system, e.g.
+        /// Japanese fonts on a non-Japanese Windows install.
+        fn tryMatchCurated(
+            self: *DiscoverIterator,
+            curated: CuratedFont,
+        ) !?DeferredFace {
+            // Curated fonts all live in the system fonts directory. We
+            // build the path locally and don't touch self.system_path,
+            // which is owned by the directory-scan states.
+            const systemroot = std.process.getEnvVarOwned(
+                self.alloc,
+                "SYSTEMROOT",
+            ) catch return null;
+            defer self.alloc.free(systemroot);
+
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const full_path = std.fmt.bufPrintZ(
+                &path_buf,
+                "{s}\\Fonts\\{s}",
+                .{ systemroot, curated.file },
+            ) catch return null;
+
+            const is_ttc = std.ascii.endsWithIgnoreCase(curated.file, ".ttc");
+            const max_faces: i32 = if (is_ttc) 16 else 1;
+
+            var face_index: i32 = 0;
+            while (face_index < max_faces) : (face_index += 1) {
+                var face = Face.initFile(
+                    self.lib,
+                    full_path,
+                    face_index,
+                    .{ .size = .{ .points = 12 } },
+                ) catch break;
+
+                // The curated family qualifier selects the right
+                // subfamily within a .ttc (e.g. "MS Gothic" rather than
+                // the proportional "MS PGothic"), on top of the regular
+                // descriptor matching.
+                if (familyMatches(&face, curated.family) and self.matches(&face)) {
+                    return try self.makeDeferred(face, full_path, face_index);
+                }
+
+                face.deinit();
+            }
+
+            return null;
+        }
+
         /// Check whether the given face matches the descriptor.
         fn matches(self: *const DiscoverIterator, face: *Face) bool {
             if (self.desc.family) |family| {
                 if (!familyMatches(face, family)) return false;
             }
+            if (!self.styleAllowed(face)) return false;
             if (self.desc.codepoint != 0) {
                 if (face.glyphIndex(self.desc.codepoint) == null) return false;
             }
             return true;
+        }
+
+        /// Check whether the face's bold/italic style flags match the
+        /// descriptor.
+        ///
+        /// On the codepoint-fallback path the descriptor is always
+        /// non-bold/non-italic (CodepointResolver only searches
+        /// fallbacks for the regular style), so this rejects e.g.
+        /// Bold-only .ttc files that would otherwise be picked just
+        /// because they sort first in the directory scan. The tradeoff:
+        /// a codepoint covered *only* by a bold/italic face becomes
+        /// unresolvable here; we accept that since the curated list
+        /// covers the common scripts with regular faces.
+        ///
+        /// On the name-query path (loading the configured font family)
+        /// the descriptor may request bold/italic, in which case this
+        /// selects the correctly-styled face instead of the first face
+        /// matching the family name. Fonts that encode weight via a
+        /// separate family name (rather than style flags) are matched
+        /// by the family check alone, as before.
+        fn styleAllowed(self: *const DiscoverIterator, face: *Face) bool {
+            const flags = face.face.handle.*.style_flags;
+            const is_bold = (flags & freetype.c.FT_STYLE_FLAG_BOLD) != 0;
+            const is_italic = (flags & freetype.c.FT_STYLE_FLAG_ITALIC) != 0;
+            return is_bold == self.desc.bold and is_italic == self.desc.italic;
         }
 
         fn makeDeferred(
