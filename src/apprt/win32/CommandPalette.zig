@@ -142,8 +142,8 @@ pub fn init(alloc: Allocator, app: *App) CommandPalette {
 }
 
 pub fn deinit(self: *CommandPalette) void {
+    self.close();
     self.filtered.deinit(self.alloc);
-    if (self.hwnd) |h| _ = DestroyWindow(h);
 }
 
 pub fn toggle(self: *CommandPalette, window: *Window) void {
@@ -199,6 +199,12 @@ fn open(self: *CommandPalette, window: *Window) !void {
             self.edit_hwnd = null;
             self.list_hwnd = null;
         }
+        if (self.bg_brush) |b| _ = sys.DeleteObject(b);
+        if (self.font_main) |f| _ = sys.DeleteObject(f);
+        if (self.font_small) |f| _ = sys.DeleteObject(f);
+        self.bg_brush = null;
+        self.font_main = null;
+        self.font_small = null;
     }
 
     // Store `self` on the window so the wndProc can access it.
@@ -379,7 +385,9 @@ fn filter(self: *CommandPalette, query: []const u8) !void {
 
 fn executeSelected(self: *CommandPalette) void {
     const lb = self.list_hwnd orelse return;
-    const sel: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCURSEL, 0, 0))));
+    // LB_GETCURSEL returns LB_ERR (-1) when there is no selection; keep
+    // the raw signed LRESULT so the guard below actually works.
+    const sel: isize = SendMessageW(lb, LB_GETCURSEL, 0, 0);
     if (sel < 0 or @as(usize, @intCast(sel)) >= self.filtered.items.len) return;
     const cmd_idx = self.filtered.items[@intCast(sel)].cmd_idx;
     const cmd = input.command.defaults[cmd_idx];
@@ -425,9 +433,9 @@ pub fn preTranslateMessage(self: *CommandPalette, msg: UINT, hwnd: HWND, wparam:
         },
         VK_UP, VK_DOWN => {
             const lb = self.list_hwnd orelse return true;
-            const count: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCOUNT, 0, 0))));
+            const count: isize = SendMessageW(lb, LB_GETCOUNT, 0, 0);
             if (count <= 0) return true;
-            var sel: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCURSEL, 0, 0))));
+            var sel: isize = SendMessageW(lb, LB_GETCURSEL, 0, 0);
             if (wparam == VK_UP and sel > 0) sel -= 1;
             if (wparam == VK_DOWN and sel < count - 1) sel += 1;
             _ = SendMessageW(lb, LB_SETCURSEL, @bitCast(sel), 0);
@@ -587,40 +595,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// Called from App.surfaceDispatch or similar to intercept keys while
-/// the palette is open. Returns true if the key was consumed.
-pub fn handleKey(self: *CommandPalette, vk: WPARAM) bool {
-    if (self.hwnd == null) return false;
-    const lb = self.list_hwnd orelse return false;
-    switch (vk) {
-        VK_ESCAPE => {
-            self.close();
-            return true;
-        },
-        VK_RETURN => {
-            self.executeSelected();
-            return true;
-        },
-        VK_UP => {
-            const count = SendMessageW(lb, LB_GETCOUNT, 0, 0);
-            if (count <= 0) return true;
-            var sel = SendMessageW(lb, LB_GETCURSEL, 0, 0);
-            if (sel > 0) sel -= 1;
-            _ = SendMessageW(lb, LB_SETCURSEL, @bitCast(sel), 0);
-            return true;
-        },
-        VK_DOWN => {
-            const count = SendMessageW(lb, LB_GETCOUNT, 0, 0);
-            if (count <= 0) return true;
-            var sel = SendMessageW(lb, LB_GETCURSEL, 0, 0);
-            if (sel < count - 1) sel += 1;
-            _ = SendMessageW(lb, LB_SETCURSEL, @bitCast(sel), 0);
-            return true;
-        },
-        else => return false,
     }
 }
 
