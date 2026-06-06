@@ -550,9 +550,9 @@ test "fuzzyMatch scoring prefers word starts and consecutive runs" {
     const gapped = fuzzyMatch("Inspector", "nt").?;
     try std.testing.expect(word_starts.score > gapped.score);
 
-    // Consecutive beats gapped for the same text.
+    // Consecutive beats gapped within the same text.
     const consec = fuzzyMatch("tab", "ta").?;
-    const gap = fuzzyMatch("t_a_b", "tb").?;
+    const gap = fuzzyMatch("tab", "tb").?;
     try std.testing.expect(consec.score > gap.score);
 
     // Positions recorded for highlighting.
