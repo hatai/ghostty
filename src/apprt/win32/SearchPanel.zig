@@ -194,7 +194,9 @@ pub fn setSearchSelected(self: *Self, selected: ?usize) void {
 }
 
 fn updateStatus(self: *Self) void {
-    if (self.hwnd) |h| _ = sys.InvalidateRect(h, null, 0);
+    // bErase=1: the status string can shrink, so the bottom row must be
+    // cleared (WM_ERASEBKGND) before paint() redraws it transparently.
+    if (self.hwnd) |h| _ = sys.InvalidateRect(h, null, 1);
 }
 
 fn emitSearchChanged(self: *Self) void {
