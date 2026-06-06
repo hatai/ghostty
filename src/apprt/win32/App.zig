@@ -431,6 +431,16 @@ pub fn closeWindow(self: *App, window: *Window) void {
     if (self.quick_terminal_window == window) {
         self.quick_terminal_window = null;
     }
+
+    // The palette may hold a pointer to this window; drop it (and
+    // close the palette) so close()'s refocus can't touch freed memory.
+    if (self.command_palette_initialized and
+        self.command_palette.target_window == window)
+    {
+        self.command_palette.close();
+        self.command_palette.target_window = null;
+    }
+
     window.deinit();
     self.alloc.destroy(window);
 
