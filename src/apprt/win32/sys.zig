@@ -148,3 +148,91 @@ pub extern "user32" fn FindWindowW(lpClassName: ?[*:0]const u16, lpWindowName: ?
 pub const ERROR_ALREADY_EXISTS: DWORD = 183;
 /// Custom app message used for single-instance "open new window" notification.
 pub const WM_APP_NEW_WINDOW: UINT = 0x8000 + 1; // WM_APP + 1
+
+// ---------------------------------------------------------------------------
+// Custom frame (titlebar-integrated tabs) support
+// ---------------------------------------------------------------------------
+
+// Messages
+pub const WM_ACTIVATE: UINT = 0x0006;
+pub const WM_SETTEXT: UINT = 0x000C;
+pub const WM_ERASEBKGND: UINT = 0x0014;
+pub const WM_NCCALCSIZE: UINT = 0x0083;
+pub const WM_NCHITTEST: UINT = 0x0084;
+pub const WM_NCMOUSEMOVE: UINT = 0x00A0;
+pub const WM_MOUSEMOVE: UINT = 0x0200;
+pub const WM_LBUTTONDOWN: UINT = 0x0201;
+pub const WM_LBUTTONUP: UINT = 0x0202;
+pub const WM_MBUTTONUP: UINT = 0x0208;
+pub const WM_MOUSELEAVE: UINT = 0x02A3;
+
+// Hit-test results
+pub const HTCLIENT: LRESULT = 1;
+pub const HTCAPTION: LRESULT = 2;
+pub const HTTOP: LRESULT = 12;
+
+// System metrics (per-DPI)
+pub const SM_CYCAPTION: c_int = 4;
+pub const SM_CYFRAME: c_int = 33;
+pub const SM_CXPADDEDBORDER: c_int = 92;
+pub extern "user32" fn GetSystemMetricsForDpi(nIndex: c_int, dpi: UINT) callconv(.winapi) c_int;
+
+// SetWindowPos flags / ShowWindow commands
+pub const SWP_FRAMECHANGED: UINT = 0x0020;
+pub const SW_MINIMIZE: c_int = 6;
+
+// WM_NCCALCSIZE parameter block (wparam == 1)
+pub const NCCALCSIZE_PARAMS = extern struct {
+    rgrc: [3]RECT,
+    lppos: ?*anyopaque,
+};
+
+// DWM
+pub const MARGINS = extern struct {
+    cxLeftWidth: c_int,
+    cxRightWidth: c_int,
+    cyTopHeight: c_int,
+    cyBottomHeight: c_int,
+};
+pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
+pub extern "dwmapi" fn DwmExtendFrameIntoClientArea(hWnd: HWND, pMarInset: *const MARGINS) callconv(.winapi) i32;
+pub extern "dwmapi" fn DwmSetWindowAttribute(hWnd: HWND, dwAttribute: DWORD, pvAttribute: *const anyopaque, cbAttribute: DWORD) callconv(.winapi) i32;
+
+// Mouse tracking (hover leave detection)
+pub const TRACKMOUSEEVENT = extern struct {
+    cbSize: DWORD,
+    dwFlags: DWORD,
+    hwndTrack: HWND,
+    dwHoverTime: DWORD,
+};
+pub const TME_LEAVE: DWORD = 0x0002;
+pub extern "user32" fn TrackMouseEvent(lpEventTrack: *TRACKMOUSEEVENT) callconv(.winapi) BOOL;
+
+// Misc helpers used by the custom titlebar
+pub extern "user32" fn ScreenToClient(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
+pub extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: c_int, lprc: *RECT, format: UINT) callconv(.winapi) c_int;
+pub extern "user32" fn DrawIconEx(hdc: HDC, xLeft: i32, yTop: i32, hIcon: HICON, cxWidth: i32, cyWidth: i32, istepIfAniCur: UINT, hbrFlickerFreeDraw: HBRUSH, diFlags: UINT) callconv(.winapi) BOOL;
+pub const DI_NORMAL: UINT = 0x0003;
+
+// DrawTextW format flags
+pub const DT_CENTER: UINT = 0x0001;
+pub const DT_VCENTER: UINT = 0x0004;
+pub const DT_SINGLELINE: UINT = 0x0020;
+pub const DT_NOPREFIX: UINT = 0x0800;
+pub const DT_END_ELLIPSIS: UINT = 0x8000;
+
+// GDI (double buffering & text)
+pub extern "gdi32" fn CreateCompatibleDC(hdc: HDC) callconv(.winapi) HDC;
+pub extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, cx: c_int, cy: c_int) callconv(.winapi) ?*anyopaque;
+pub extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+pub extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) BOOL;
+pub extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.winapi) BOOL;
+pub extern "gdi32" fn BitBlt(hdc: HDC, x: c_int, y: c_int, cx: c_int, cy: c_int, hdcSrc: HDC, x1: c_int, y1: c_int, rop: DWORD) callconv(.winapi) BOOL;
+pub const SRCCOPY: DWORD = 0x00CC0020;
+pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: c_int) callconv(.winapi) c_int;
+pub const TRANSPARENT: c_int = 1;
+pub extern "gdi32" fn SetTextColor(hdc: HDC, color: u32) callconv(.winapi) u32;
+pub extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
+pub extern "user32" fn FillRect(hDC: HDC, lprc: *const RECT, hbr: ?*anyopaque) callconv(.winapi) c_int;
+pub extern "gdi32" fn CreateFontW(cHeight: c_int, cWidth: c_int, cEscapement: c_int, cOrientation: c_int, cWeight: c_int, bItalic: DWORD, bUnderline: DWORD, bStrikeOut: DWORD, iCharSet: DWORD, iOutPrecision: DWORD, iClipPrecision: DWORD, iQuality: DWORD, iPitchAndFamily: DWORD, pszFaceName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
