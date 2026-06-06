@@ -6,7 +6,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 const input = @import("../../input.zig");
-const Command = input.command.Command;
 const sys = @import("sys.zig");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
