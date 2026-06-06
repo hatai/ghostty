@@ -870,9 +870,9 @@ pub fn performAction(
             return true;
         },
         .toggle_tab_overview => {
-            const window = self.focused_window orelse return false;
-            if (window.tab_hwnd) |hwnd| _ = sys.SetFocus(hwnd);
-            return true;
+            // Tab overview is integrated into the custom titlebar; no
+            // separate control to focus.
+            return false;
         },
         .toggle_quick_terminal => {
             if (self.quick_terminal_window) |window| {

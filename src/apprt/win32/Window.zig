@@ -25,11 +25,7 @@ const LRESULT = sys.LRESULT;
 
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
-const WS_TABSTOP: u32 = 0x00010000;
 const WS_CLIPCHILDREN: u32 = 0x02000000;
-const TCS_FIXEDWIDTH: u32 = 0x0400;
-const WM_NOTIFY: UINT = 0x004E;
-const WM_SETFONT: UINT = 0x0030;
 const WM_PAINT: UINT = 0x000F;
 const WM_LBUTTONDOWN: UINT = 0x0201;
 const WM_LBUTTONUP: UINT = 0x0202;
@@ -37,46 +33,10 @@ const WM_MOUSEMOVE: UINT = 0x0200;
 const WM_CAPTURECHANGED: UINT = 0x0215;
 const WM_SETCURSOR: UINT = 0x0020;
 const SW_HIDE: c_int = 0;
-const TCM_FIRST: UINT = 0x1300;
-const TCM_GETCURSEL: UINT = TCM_FIRST + 11;
-const TCM_SETCURSEL: UINT = TCM_FIRST + 12;
-const TCM_DELETEITEM: UINT = TCM_FIRST + 8;
-const TCM_DELETEALLITEMS: UINT = TCM_FIRST + 9;
-const TCM_INSERTITEMW: UINT = TCM_FIRST + 62;
-const TCM_SETITEMW: UINT = TCM_FIRST + 61;
-const TCM_SETITEMSIZE: UINT = TCM_FIRST + 41;
-const TCIF_TEXT: UINT = 0x0001;
-const TCN_FIRST: i32 = -550;
-const TCN_SELCHANGE: i32 = TCN_FIRST - 1;
-const ICC_TAB_CLASSES: DWORD = 0x00000008;
-const TAB_HEIGHT: i32 = 30;
 const DIVIDER_THICKNESS: i32 = 10;
 const IDC_SIZEWE = @as(?[*:0]align(1) const u16, @ptrFromInt(32644));
 const IDC_SIZENS = @as(?[*:0]align(1) const u16, @ptrFromInt(32645));
 
-const NMHDR = extern struct {
-    hwndFrom: HWND,
-    idFrom: usize,
-    code: i32,
-};
-
-const INITCOMMONCONTROLSEX = extern struct {
-    dwSize: DWORD,
-    dwICC: DWORD,
-};
-
-const TCITEMW = extern struct {
-    mask: UINT,
-    dwState: DWORD = 0,
-    dwStateMask: DWORD = 0,
-    pszText: ?[*:0]u16 = null,
-    cchTextMax: c_int = 0,
-    iImage: c_int = 0,
-    lParam: LPARAM = 0,
-};
-
-extern "comctl32" fn InitCommonControlsEx(lpInitCtrls: *const INITCOMMONCONTROLSEX) callconv(.winapi) BOOL;
-extern "gdi32" fn CreateFontW(cHeight: c_int, cWidth: c_int, cEscapement: c_int, cOrientation: c_int, cWeight: c_int, bItalic: DWORD, bUnderline: DWORD, bStrikeOut: DWORD, iCharSet: DWORD, iOutPrecision: DWORD, iClipPrecision: DWORD, iQuality: DWORD, iPitchAndFamily: DWORD, pszFaceName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.winapi) BOOL;
 extern "user32" fn FillRect(hDC: ?*anyopaque, lprc: *const RECT, hbr: ?*anyopaque) callconv(.winapi) c_int;
@@ -84,7 +44,6 @@ extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 extern "user32" fn SetCursor(hCursor: sys.HCURSOR) callconv(.winapi) sys.HCURSOR;
 
-var ui_font: ?*anyopaque = null;
 var divider_class_registered: bool = false;
 
 const DividerState = struct {
@@ -129,7 +88,6 @@ const TabState = struct {
 
 app: *App,
 hwnd: ?HWND = null,
-tab_hwnd: ?HWND = null,
 titlebar: TitleBar = .{},
 primary_surface: *Surface,
 tree: ?SplitTree = null,
@@ -164,7 +122,6 @@ pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
         if (self.hwnd) |h| _ = sys.DestroyWindow(h);
     }
 
-    try self.createTabControl();
     // Must be set before setupCustomFrame: the synchronous WM_NCCALCSIZE
     // triggered by SWP_FRAMECHANGED calls getWindow, which reads GWLP_USERDATA.
     _ = sys.SetWindowLongPtrW(self.hwnd.?, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -186,15 +143,12 @@ pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
 
 pub fn deinit(self: *Window) void {
     self.destroyDividers();
+    self.titlebar.deinit();
     self.syncActiveTabFromWindow();
     for (self.tabs.items) |*tab| self.deinitTab(tab);
     self.tabs.deinit(self.app.alloc);
     self.tree = null;
     self.surface_initialized = false;
-    if (self.tab_hwnd) |hwnd| {
-        _ = sys.DestroyWindow(hwnd);
-        self.tab_hwnd = null;
-    }
     if (self.hwnd) |hwnd| {
         _ = sys.DestroyWindow(hwnd);
         self.hwnd = null;
@@ -274,49 +228,6 @@ fn setupCustomFrame(self: *Window) void {
 
     // Force WM_NCCALCSIZE so the new frame takes effect.
     _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | sys.SWP_FRAMECHANGED);
-}
-
-fn createTabControl(self: *Window) !void {
-    const icc: INITCOMMONCONTROLSEX = .{
-        .dwSize = @sizeOf(INITCOMMONCONTROLSEX),
-        .dwICC = ICC_TAB_CLASSES,
-    };
-    _ = InitCommonControlsEx(&icc);
-    self.tab_hwnd = sys.CreateWindowExW(
-        0,
-        std.unicode.utf8ToUtf16LeStringLiteral("SysTabControl32"),
-        std.unicode.utf8ToUtf16LeStringLiteral(""),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_FIXEDWIDTH,
-        0,
-        0,
-        0,
-        TAB_HEIGHT,
-        self.hwnd,
-        null,
-        sys.GetModuleHandleW(null),
-        null,
-    ) orelse return error.Win32Error;
-    if (ui_font == null) {
-        ui_font = CreateFontW(
-            -18,
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-        );
-    }
-    if (ui_font) |font| {
-        _ = sys.SendMessageW(self.tab_hwnd.?, WM_SETFONT, @intFromPtr(font), 1);
-    }
 }
 
 fn registerDividerClass() !void {
@@ -562,14 +473,12 @@ fn insertTab(self: *Window, raw_index: usize, opts: CreateOptions, select: bool)
         self.current_tab += 1;
     }
 
-    self.rebuildTabControl();
-    self.updateTabVisibility();
+    self.invalidateTitleBar();
 
     if (select or self.tabs.items.len == 1) {
         try self.activateTab(index);
     } else {
         self.hideTabSurfaces(&self.tabs.items[index]);
-        _ = sys.SendMessageW(self.tab_hwnd.?, TCM_SETCURSEL, self.current_tab, 0);
     }
 
     return index;
@@ -626,17 +535,7 @@ pub fn setActiveTabTitle(self: *Window, title: [:0]const u8) !void {
     const tab = self.activeTab() orelse return;
     self.app.alloc.free(tab.title);
     tab.title = try self.app.alloc.dupeZ(u8, title);
-    self.updateTabControlTitle(self.current_tab);
-}
-
-fn updateTabVisibility(self: *Window) void {
-    const hwnd = self.tab_hwnd orelse return;
-    _ = sys.ShowWindow(hwnd, if (self.tabs.items.len > 1) sys.SW_SHOWNORMAL else SW_HIDE);
-    self.updateTabMetrics();
-}
-
-fn tabClientHeight(self: *Window) i32 {
-    return if (self.tabs.items.len > 1) TAB_HEIGHT else 0;
+    self.invalidateTitleBar();
 }
 
 /// Height of the custom titlebar strip in client pixels. Zero when
@@ -694,59 +593,9 @@ fn showTabSurfaces(_: *Window, tab: *TabState) void {
     }
 }
 
-fn rebuildTabControl(self: *Window) void {
-    const hwnd = self.tab_hwnd orelse return;
-    _ = sys.SendMessageW(hwnd, TCM_DELETEALLITEMS, 0, 0);
-    for (self.tabs.items, 0..) |_, i| self.insertTabControlItem(i) catch {};
-    if (self.tabs.items.len > 0) {
-        _ = sys.SendMessageW(hwnd, TCM_SETCURSEL, self.current_tab, 0);
-    }
-    self.updateTabMetrics();
-}
-
-fn updateTabMetrics(self: *Window) void {
-    const hwnd = self.tab_hwnd orelse return;
-    if (self.tabs.items.len <= 1) return;
-
-    var rect: RECT = std.mem.zeroes(RECT);
-    if (sys.GetClientRect(self.hwnd orelse return, &rect) == 0) return;
-
-    const total_width = rect.right - rect.left;
-    if (total_width <= 0) return;
-
-    const tabs_i32: i32 = @intCast(self.tabs.items.len);
-    const width = @max(110, @divTrunc(total_width - 24, tabs_i32));
-    const size_param: LPARAM = (@as(LPARAM, TAB_HEIGHT) << 16) | @as(LPARAM, @intCast(width & 0xFFFF));
-    _ = sys.SendMessageW(hwnd, TCM_SETITEMSIZE, 0, size_param);
-    _ = sys.InvalidateRect(hwnd, null, 1);
-}
-
-fn insertTabControlItem(self: *Window, index: usize) !void {
-    const hwnd = self.tab_hwnd orelse return;
-    const utf16 = try std.unicode.utf8ToUtf16LeAllocZ(self.app.alloc, self.tabs.items[index].title);
-    defer self.app.alloc.free(utf16);
-    var item: TCITEMW = .{
-        .mask = TCIF_TEXT,
-        .pszText = utf16.ptr,
-    };
-    _ = sys.SendMessageW(hwnd, TCM_INSERTITEMW, index, @bitCast(@intFromPtr(&item)));
-}
-
-fn updateTabControlTitle(self: *Window, index: usize) void {
-    const hwnd = self.tab_hwnd orelse return;
-    const utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.app.alloc, self.tabs.items[index].title) catch return;
-    defer self.app.alloc.free(utf16);
-    var item: TCITEMW = .{
-        .mask = TCIF_TEXT,
-        .pszText = utf16.ptr,
-    };
-    _ = sys.SendMessageW(hwnd, TCM_SETITEMW, index, @bitCast(@intFromPtr(&item)));
-}
-
 fn activateTab(self: *Window, index: usize) !void {
     if (self.tabs.items.len == 0 or index >= self.tabs.items.len) return;
     if (index == self.current_tab and self.tree != null) {
-        _ = sys.SendMessageW(self.tab_hwnd.?, TCM_SETCURSEL, index, 0);
         self.relayout();
         if (self.focused_surface) |surface| _ = sys.SetFocus(surface.hwnd);
         return;
@@ -760,7 +609,7 @@ fn activateTab(self: *Window, index: usize) !void {
     self.current_tab = index;
     self.loadActiveTabIntoWindow();
     self.showTabSurfaces(&self.tabs.items[self.current_tab]);
-    if (self.tab_hwnd) |hwnd| _ = sys.SendMessageW(hwnd, TCM_SETCURSEL, index, 0);
+    self.invalidateTitleBar();
     self.relayout();
     if (self.focused_surface) |surface| _ = sys.SetFocus(surface.hwnd);
 }
@@ -790,7 +639,6 @@ fn closeTabAt(self: *Window, index: usize) void {
 
     var tab = self.tabs.orderedRemove(index);
     self.deinitTab(&tab);
-    if (self.tab_hwnd) |hwnd| _ = sys.SendMessageW(hwnd, TCM_DELETEITEM, index, 0);
 
     if (self.tabs.items.len == 0) {
         self.tree = null;
@@ -813,8 +661,7 @@ fn closeTabAt(self: *Window, index: usize) void {
         self.showTabSurfaces(&self.tabs.items[self.current_tab]);
     }
 
-    self.updateTabVisibility();
-    self.rebuildTabControl();
+    self.invalidateTitleBar();
     self.activateTab(self.current_tab) catch {};
 }
 
@@ -849,8 +696,7 @@ fn closeEmptyTabAt(self: *Window, index: usize) void {
         self.showTabSurfaces(&self.tabs.items[self.current_tab]);
     }
 
-    self.updateTabVisibility();
-    self.rebuildTabControl();
+    self.invalidateTitleBar();
     self.activateTab(self.current_tab) catch {};
 }
 
@@ -887,7 +733,7 @@ pub fn moveTab(self: *Window, amount: isize) bool {
     const moved = self.tabs.orderedRemove(old_idx);
     self.tabs.insert(self.app.alloc, new_idx, moved) catch return false;
     self.current_tab = new_idx;
-    self.rebuildTabControl();
+    self.invalidateTitleBar();
     self.activateTab(new_idx) catch {};
     return true;
 }
@@ -948,11 +794,17 @@ pub fn applyConfiguredWindowSize(self: *Window) void {
     if (cell_width == 0 or cell_height == 0) return;
 
     const w: i32 = @intCast(@max(10, cfg_w) * cell_width);
-    const h: i32 = @intCast(@as(i32, @intCast(@max(4, cfg_h) * cell_height)) + self.tabClientHeight());
+    const h: i32 = @intCast(@as(i32, @intCast(@max(4, cfg_h) * cell_height)) + self.titleBarHeight());
 
     var rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = h };
     _ = sys.AdjustWindowRectEx(&rect, sys.WS_OVERLAPPEDWINDOW, 0, 0);
-    _ = sys.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, 0x0002 | 0x0004);
+    // The custom frame has no caption; AdjustWindowRectEx includes one.
+    var height = rect.bottom - rect.top;
+    if (!self.quick_terminal) {
+        const dpi = sys.GetDpiForWindow(hwnd);
+        height -= sys.GetSystemMetricsForDpi(sys.SM_CYCAPTION, dpi);
+    }
+    _ = sys.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, height, 0x0002 | 0x0004);
 }
 
 pub fn applyQuickTerminalLayout(self: *Window) void {
@@ -994,11 +846,7 @@ pub fn relayout(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     var rect: RECT = std.mem.zeroes(RECT);
     if (sys.GetClientRect(hwnd, &rect) == 0) return;
-    self.updateTabMetrics();
-    const tab_h = self.tabClientHeight();
-    if (self.tab_hwnd) |tab_hwnd| {
-        _ = sys.SetWindowPos(tab_hwnd, null, 0, 0, rect.right - rect.left, tab_h, 0x0004);
-    }
+    const tab_h = self.titleBarHeight();
     const bounds = SplitTree.Rect{
         .x = 0,
         .y = tab_h,
@@ -1007,6 +855,7 @@ pub fn relayout(self: *Window) void {
     };
     tree.layout(bounds, relayoutCb);
     self.updateDividers(bounds);
+    self.invalidateTitleBar();
 }
 
 fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
@@ -1101,9 +950,9 @@ pub fn gotoSplit(self: *Window, target: apprt.action.GotoSplit) void {
     if (sys.GetClientRect(hwnd, &cr) == 0) return;
     const bounds: SplitTree.Rect = .{
         .x = 0,
-        .y = self.tabClientHeight(),
+        .y = self.titleBarHeight(),
         .w = cr.right - cr.left,
-        .h = cr.bottom - cr.top - self.tabClientHeight(),
+        .h = cr.bottom - cr.top - self.titleBarHeight(),
     };
     const count = tree.collectLeafRects(bounds, &buf);
     if (count == 0) return;
@@ -1297,18 +1146,149 @@ pub fn handleTopLevelMessage(self: *Window, msg: UINT, wparam: WPARAM, lparam: L
             return null;
         },
         sys.WM_ERASEBKGND => return 1,
-        WM_NOTIFY => {
-            const hdr: *const NMHDR = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            if (self.tab_hwnd != null and hdr.hwndFrom == self.tab_hwnd.? and hdr.code == TCN_SELCHANGE) {
-                const sel = sys.SendMessageW(self.tab_hwnd.?, TCM_GETCURSEL, 0, 0);
-                const idx: usize = @intCast(sel);
-                self.activateTab(idx) catch {};
-                return 0;
+        sys.WM_PAINT => {
+            const hwnd = self.hwnd orelse return null;
+            var ps: sys.PAINTSTRUCT = std.mem.zeroes(sys.PAINTSTRUCT);
+            const hdc = sys.BeginPaint(hwnd, &ps);
+            defer _ = sys.EndPaint(hwnd, &ps);
+
+            var rect: RECT = std.mem.zeroes(RECT);
+            _ = sys.GetClientRect(hwnd, &rect);
+            const width = rect.right - rect.left;
+            const bar_h = self.titleBarHeight();
+
+            // Anything below the strip belongs to child windows;
+            // clear exposed leftovers with the terminal background.
+            if (ps.rcPaint.bottom > bar_h) {
+                const bg = self.app.config.background;
+                const brush = sys.CreateSolidBrush(
+                    (TitleBar.Rgb{ .r = bg.r, .g = bg.g, .b = bg.b }).colorref(),
+                ) orelse return 0;
+                defer _ = sys.DeleteObject(brush);
+                var below = ps.rcPaint;
+                below.top = @max(below.top, bar_h);
+                _ = sys.FillRect(hdc, &below, brush);
             }
+
+            if (bar_h > 0 and width > 0) {
+                // Collect tab titles (UTF-8).
+                var titles_buf: [64][:0]const u8 = undefined;
+                const count = @min(self.tabs.items.len, titles_buf.len);
+                for (self.tabs.items[0..count], 0..) |tab, i| titles_buf[i] = tab.title;
+                // Teardown can paint with zero tabs; keep titles valid.
+                if (count == 0) titles_buf[0] = "";
+
+                // Window title (UTF-16) for the single-tab state.
+                var title_buf: [256]u16 = undefined;
+                const title_len = sys.GetWindowTextW(hwnd, &title_buf, @intCast(title_buf.len));
+
+                self.titlebar.paint(.{
+                    .dc = hdc,
+                    .width = width,
+                    .dpi = sys.GetDpiForWindow(hwnd),
+                    .palette = self.themePalette(),
+                    .titles = titles_buf[0..@max(count, 1)],
+                    .current = self.current_tab,
+                    .single_title = title_buf[0..@intCast(@max(title_len, 0))],
+                    .maximized = sys.IsZoomed(hwnd) != 0,
+                    .icon = sys.LoadIconW(sys.GetModuleHandleW(null), @ptrFromInt(1)),
+                });
+            }
+            return 0;
+        },
+        sys.WM_MOUSEMOVE => {
+            const hwnd = self.hwnd orelse return null;
+            const elem = self.titleBarHit(lparam);
+            if (!elem.eql(self.titlebar.hover)) {
+                self.titlebar.hover = elem;
+                self.invalidateTitleBar();
+            }
+            if (!self.titlebar.tracking_mouse) {
+                var tme: sys.TRACKMOUSEEVENT = .{
+                    .cbSize = @sizeOf(sys.TRACKMOUSEEVENT),
+                    .dwFlags = sys.TME_LEAVE,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                _ = sys.TrackMouseEvent(&tme);
+                self.titlebar.tracking_mouse = true;
+            }
+            return 0;
+        },
+        sys.WM_MOUSELEAVE, sys.WM_NCMOUSEMOVE => {
+            self.titlebar.tracking_mouse = false;
+            if (!self.titlebar.hover.eql(.none)) {
+                self.titlebar.hover = .none;
+                self.invalidateTitleBar();
+            }
+            return null;
+        },
+        sys.WM_LBUTTONDOWN => {
+            const elem = self.titleBarHit(lparam);
+            switch (elem) {
+                .none, .caption => {},
+                .tab => |i| self.activateTab(i) catch {},
+                // Buttons act on release (standard Windows behavior).
+                // Note: variants with differing payload types cannot be
+                // grouped in one prong, hence the else.
+                else => {
+                    self.titlebar.pressed = elem;
+                    _ = SetCapture(self.hwnd.?);
+                    self.invalidateTitleBar();
+                },
+            }
+            return 0;
+        },
+        sys.WM_LBUTTONUP => {
+            const pressed = self.titlebar.pressed;
+            if (pressed.eql(.none)) return 0;
+            self.titlebar.pressed = .none;
+            _ = ReleaseCapture();
+            const elem = self.titleBarHit(lparam);
+            if (elem.eql(pressed)) {
+                const hwnd = self.hwnd.?;
+                switch (pressed) {
+                    .tab_close => |i| self.closeTabAt(i),
+                    .new_tab => self.newTab(.none) catch {},
+                    .minimize => _ = sys.ShowWindow(hwnd, sys.SW_MINIMIZE),
+                    .maximize => _ = sys.ShowWindow(
+                        hwnd,
+                        if (sys.IsZoomed(hwnd) != 0) sys.SW_RESTORE else sys.SW_MAXIMIZE,
+                    ),
+                    .close => _ = sys.PostMessageW(hwnd, sys.WM_CLOSE, 0, 0),
+                    else => {},
+                }
+            }
+            self.invalidateTitleBar();
+            return 0;
+        },
+        sys.WM_MBUTTONUP => {
+            switch (self.titleBarHit(lparam)) {
+                .tab, .tab_close => |i| self.closeTabAt(i),
+                else => {},
+            }
+            return 0;
         },
         else => {},
     }
     return null;
+}
+
+/// Map a client-coordinate mouse lparam to a titlebar element.
+fn titleBarHit(self: *Window, lparam: LPARAM) TitleBar.Element {
+    const hwnd = self.hwnd orelse return .none;
+    const bar_h = self.titleBarHeight();
+    if (bar_h == 0) return .none;
+    const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
+    const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+    var rect: RECT = std.mem.zeroes(RECT);
+    _ = sys.GetClientRect(hwnd, &rect);
+    const layout = TitleBar.Layout.compute(
+        sys.GetDpiForWindow(hwnd),
+        rect.right - rect.left,
+        @max(self.tabs.items.len, 1),
+    );
+    return layout.hitTest(x, y, sys.IsZoomed(hwnd) != 0);
 }
 
 pub fn toggleFullscreen(self: *Window) void {
