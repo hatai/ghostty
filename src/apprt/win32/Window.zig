@@ -1269,6 +1269,15 @@ pub fn handleTopLevelMessage(self: *Window, msg: UINT, wparam: WPARAM, lparam: L
             }
             return 0;
         },
+        WM_CAPTURECHANGED => {
+            // Capture stolen mid-press (e.g. a system action between
+            // button down and up): reset the titlebar press state.
+            if (!self.titlebar.pressed.eql(.none)) {
+                self.titlebar.pressed = .none;
+                self.invalidateTitleBar();
+            }
+            return null;
+        },
         else => {},
     }
     return null;
