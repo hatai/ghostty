@@ -163,10 +163,12 @@ pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
     errdefer {
         if (self.hwnd) |h| _ = sys.DestroyWindow(h);
     }
-    self.setupCustomFrame();
 
     try self.createTabControl();
+    // Must be set before setupCustomFrame: the synchronous WM_NCCALCSIZE
+    // triggered by SWP_FRAMECHANGED calls getWindow, which reads GWLP_USERDATA.
     _ = sys.SetWindowLongPtrW(self.hwnd.?, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    self.setupCustomFrame();
 
     _ = try self.insertTab(0, opts, true);
     if (self.quick_terminal) self.applyQuickTerminalLayout() else self.applyConfiguredWindowSize();
@@ -1289,7 +1291,8 @@ pub fn handleTopLevelMessage(self: *Window, msg: UINT, wparam: WPARAM, lparam: L
         },
         sys.WM_SETTEXT => {
             // Window title is drawn in the strip when a single tab is
-            // open; repaint after the default proc stores the text.
+            // open. InvalidateRect only queues a WM_PAINT, which runs
+            // after the default proc has stored the new text.
             self.invalidateTitleBar();
             return null;
         },
@@ -1313,6 +1316,8 @@ pub fn toggleFullscreen(self: *Window) void {
     if (self.fullscreen.active) {
         _ = sys.SetWindowLongW(hwnd, sys.GWL_STYLE, self.fullscreen.style);
         _ = sys.SetWindowLongW(hwnd, sys.GWL_EXSTYLE, self.fullscreen.ex_style);
+        // Must be set before SetWindowPos: WM_NCCALCSIZE reads this flag.
+        self.fullscreen.active = false;
         _ = sys.SetWindowPos(
             hwnd,
             null,
@@ -1322,7 +1327,6 @@ pub fn toggleFullscreen(self: *Window) void {
             self.fullscreen.rect.bottom - self.fullscreen.rect.top,
             0x0020 | 0x0004,
         );
-        self.fullscreen.active = false;
     } else {
         self.fullscreen.style = @intCast(sys.GetWindowLongW(hwnd, sys.GWL_STYLE));
         self.fullscreen.ex_style = @intCast(sys.GetWindowLongW(hwnd, sys.GWL_EXSTYLE));
@@ -1335,6 +1339,8 @@ pub fn toggleFullscreen(self: *Window) void {
 
         const new_style = self.fullscreen.style & ~@as(i32, @bitCast(@as(u32, sys.WS_OVERLAPPEDWINDOW)));
         _ = sys.SetWindowLongW(hwnd, sys.GWL_STYLE, new_style);
+        // Must be set before SetWindowPos: WM_NCCALCSIZE reads this flag.
+        self.fullscreen.active = true;
         _ = sys.SetWindowPos(
             hwnd,
             null,
@@ -1344,6 +1350,5 @@ pub fn toggleFullscreen(self: *Window) void {
             mi.rcMonitor.bottom - mi.rcMonitor.top,
             0x0020 | 0x0004,
         );
-        self.fullscreen.active = true;
     }
 }
