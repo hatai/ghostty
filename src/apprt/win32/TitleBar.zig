@@ -265,6 +265,312 @@ pub const Layout = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Painting
+// ---------------------------------------------------------------------------
+
+// GDI+ flat C API (anti-aliased shapes). COM-free; just GdiplusStartup
+// once, then create a Graphics per paint from the target HDC.
+const GdiplusStartupInput = extern struct {
+    GdiplusVersion: u32 = 1,
+    DebugEventCallback: ?*anyopaque = null,
+    SuppressBackgroundThread: i32 = 0,
+    SuppressExternalCodecs: i32 = 0,
+};
+extern "gdiplus" fn GdiplusStartup(token: *usize, input: *const GdiplusStartupInput, output: ?*anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipCreateFromHDC(hdc: sys.HDC, graphics: **anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipDeleteGraphics(graphics: *anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipSetSmoothingMode(graphics: *anyopaque, mode: c_int) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipCreateSolidFill(color: u32, brush: **anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipDeleteBrush(brush: *anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipCreatePath(fill_mode: c_int, path: **anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipDeletePath(path: *anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipAddPathArc(path: *anyopaque, x: f32, y: f32, w: f32, h: f32, start: f32, sweep: f32) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipAddPathLine(path: *anyopaque, x1: f32, y1: f32, x2: f32, y2: f32) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipClosePathFigure(path: *anyopaque) callconv(.winapi) c_int;
+extern "gdiplus" fn GdipFillPath(graphics: *anyopaque, brush: *anyopaque, path: *anyopaque) callconv(.winapi) c_int;
+
+const smoothing_antialias: c_int = 4;
+
+var gdiplus_token: usize = 0;
+
+fn ensureGdiplus() void {
+    if (gdiplus_token != 0) return;
+    const input: GdiplusStartupInput = .{};
+    _ = GdiplusStartup(&gdiplus_token, &input, null);
+}
+
+/// Fill a rectangle whose top two corners are rounded (the classic
+/// "tab" shape); bottom edge is square so the active tab merges into
+/// the terminal area below.
+fn fillRoundedTop(g: *anyopaque, color: u32, r: RECT, radius: i32) void {
+    var brush: *anyopaque = undefined;
+    if (GdipCreateSolidFill(color, &brush) != 0) return;
+    defer _ = GdipDeleteBrush(brush);
+
+    var path: *anyopaque = undefined;
+    if (GdipCreatePath(0, &path) != 0) return;
+    defer _ = GdipDeletePath(path);
+
+    const x: f32 = @floatFromInt(r.left);
+    const y: f32 = @floatFromInt(r.top);
+    const w: f32 = @floatFromInt(r.right - r.left);
+    const h: f32 = @floatFromInt(r.bottom - r.top);
+    const d: f32 = @floatFromInt(radius * 2);
+
+    _ = GdipAddPathArc(path, x, y, d, d, 180, 90); // top-left corner
+    _ = GdipAddPathArc(path, x + w - d, y, d, d, 270, 90); // top-right corner
+    _ = GdipAddPathLine(path, x + w, y + d / 2, x + w, y + h);
+    _ = GdipAddPathLine(path, x + w, y + h, x, y + h);
+    _ = GdipClosePathFigure(path);
+    _ = GdipFillPath(g, brush, path);
+}
+
+fn ensureFonts(self: *TitleBar, dpi: u32) void {
+    if (self.fonts_dpi == dpi and self.text_font != null) return;
+    if (self.text_font) |f| _ = sys.DeleteObject(f);
+    if (self.glyph_font) |f| _ = sys.DeleteObject(f);
+    self.text_font = sys.CreateFontW(
+        -s(dpi, 12), // ~9pt UI text
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        5, // CLEARTYPE_QUALITY
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+    );
+    self.glyph_font = sys.CreateFontW(
+        -s(dpi, 10),
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        5, // CLEARTYPE_QUALITY
+        0,
+        // Caption glyphs (minimize/maximize/restore/close) come from
+        // the system icon font, same as native Windows titlebars.
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe MDL2 Assets"),
+    );
+    self.fonts_dpi = dpi;
+}
+
+fn drawTextUtf8(dc: sys.HDC, text: []const u8, rect: RECT, color: u32, flags: sys.UINT) void {
+    var wbuf: [256]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return;
+    if (wlen == 0) return;
+    _ = sys.SetTextColor(dc, color);
+    var r = rect;
+    _ = sys.DrawTextW(dc, wbuf[0..wlen].ptr, @intCast(wlen), &r, flags);
+}
+
+fn drawTextUtf16(dc: sys.HDC, text: []const u16, rect: RECT, color: u32, flags: sys.UINT) void {
+    if (text.len == 0) return;
+    _ = sys.SetTextColor(dc, color);
+    var r = rect;
+    _ = sys.DrawTextW(dc, text.ptr, @intCast(text.len), &r, flags);
+}
+
+fn fillRect(dc: sys.HDC, rect: RECT, color: u32) void {
+    const brush = sys.CreateSolidBrush(color) orelse return;
+    defer _ = sys.DeleteObject(brush);
+    _ = sys.FillRect(dc, &rect, brush);
+}
+
+// Segoe MDL2 Assets glyph codepoints (native caption glyphs).
+const glyph_minimize = std.unicode.utf8ToUtf16LeStringLiteral("\u{E921}");
+const glyph_maximize = std.unicode.utf8ToUtf16LeStringLiteral("\u{E922}");
+const glyph_restore = std.unicode.utf8ToUtf16LeStringLiteral("\u{E923}");
+const glyph_close = std.unicode.utf8ToUtf16LeStringLiteral("\u{E8BB}");
+
+pub const PaintInfo = struct {
+    dc: sys.HDC,
+    width: i32,
+    dpi: u32,
+    palette: Palette,
+    /// UTF-8 tab titles. len >= 1.
+    titles: []const [:0]const u8,
+    current: usize,
+    /// Window title (UTF-16) shown when only one tab exists.
+    single_title: []const u16,
+    maximized: bool,
+    icon: sys.HICON,
+};
+
+pub fn paint(self: *TitleBar, info: PaintInfo) void {
+    ensureGdiplus();
+    self.ensureFonts(info.dpi);
+
+    const layout = Layout.compute(info.dpi, info.width, info.titles.len);
+    const h = layout.height;
+
+    // Double buffer: render everything into a memory DC, then blit.
+    const mem_dc = sys.CreateCompatibleDC(info.dc) orelse return;
+    defer _ = sys.DeleteDC(mem_dc);
+    const bitmap = sys.CreateCompatibleBitmap(info.dc, info.width, h) orelse return;
+    defer _ = sys.DeleteObject(bitmap);
+    const old_bitmap = sys.SelectObject(mem_dc, bitmap);
+    defer _ = sys.SelectObject(mem_dc, old_bitmap);
+
+    _ = sys.SetBkMode(mem_dc, sys.TRANSPARENT);
+
+    const pal = &info.palette;
+    fillRect(mem_dc, .{ .left = 0, .top = 0, .right = info.width, .bottom = h }, pal.bar_bg.colorref());
+
+    // App icon on the left.
+    if (info.icon != null) {
+        const size = s(info.dpi, 16);
+        _ = sys.DrawIconEx(
+            mem_dc,
+            @divTrunc(layout.icon_w - size, 2),
+            @divTrunc(h - size, 2),
+            info.icon,
+            size,
+            size,
+            0,
+            null,
+            sys.DI_NORMAL,
+        );
+    }
+
+    const text_flags = sys.DT_SINGLELINE | sys.DT_VCENTER | sys.DT_NOPREFIX | sys.DT_END_ELLIPSIS;
+    const old_font = sys.SelectObject(mem_dc, self.text_font);
+    defer _ = sys.SelectObject(mem_dc, old_font);
+
+    if (!layout.show_tabs) {
+        // Single tab: plain window title, no tab shapes.
+        const r: RECT = .{
+            .left = layout.icon_w + s(info.dpi, 4),
+            .top = 0,
+            .right = layout.buttons_x - s(info.dpi, 8),
+            .bottom = h,
+        };
+        drawTextUtf16(
+            mem_dc,
+            info.single_title,
+            r,
+            pal.textColor(true, self.window_active).colorref(),
+            text_flags,
+        );
+    } else {
+        // Tab shapes need GDI+ (anti-aliased round tops).
+        var graphics: *anyopaque = undefined;
+        const has_g = GdipCreateFromHDC(mem_dc, &graphics) == 0;
+        defer if (has_g) {
+            _ = GdipDeleteGraphics(graphics);
+        };
+        if (has_g) _ = GdipSetSmoothingMode(graphics, smoothing_antialias);
+
+        for (info.titles, 0..) |title, i| {
+            const tr = layout.tabRect(i);
+            const is_current = i == info.current;
+            const is_hover = self.hover.eql(.{ .tab = i }) or self.hover.eql(.{ .tab_close = i });
+
+            if (has_g) {
+                if (is_current) {
+                    fillRoundedTop(graphics, pal.active_tab.argb(), tr, layout.radius);
+                } else if (is_hover) {
+                    fillRoundedTop(graphics, pal.hover_tab.argb(), tr, layout.radius);
+                }
+            }
+
+            // "N · title", ellipsized.
+            var label_buf: [128]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "{d} · {s}", .{ i + 1, title }) catch title;
+
+            const close_r = layout.tabCloseRect(i);
+            const show_close = is_current or is_hover;
+            const text_r: RECT = .{
+                .left = tr.left + s(info.dpi, 12),
+                .top = tr.top,
+                .right = if (show_close) close_r.left - s(info.dpi, 4) else tr.right - s(info.dpi, 12),
+                .bottom = tr.bottom,
+            };
+            drawTextUtf8(
+                mem_dc,
+                label,
+                text_r,
+                pal.textColor(is_current, self.window_active).colorref(),
+                text_flags,
+            );
+
+            if (show_close) {
+                const hover_close = self.hover.eql(.{ .tab_close = i });
+                _ = sys.SelectObject(mem_dc, self.glyph_font);
+                drawTextUtf16(
+                    mem_dc,
+                    glyph_close,
+                    close_r,
+                    pal.textColor(hover_close, self.window_active).colorref(),
+                    sys.DT_SINGLELINE | sys.DT_VCENTER | sys.DT_CENTER | sys.DT_NOPREFIX,
+                );
+                _ = sys.SelectObject(mem_dc, self.text_font);
+            }
+        }
+
+        // "+" (new tab) button.
+        const plus_r: RECT = .{
+            .left = layout.plus_x,
+            .top = layout.tab_top,
+            .right = layout.plus_x + layout.plus_w,
+            .bottom = h,
+        };
+        if (self.hover.eql(.new_tab)) fillRect(mem_dc, plus_r, pal.btn_hover.colorref());
+        drawTextUtf8(
+            mem_dc,
+            "+",
+            plus_r,
+            pal.textColor(false, self.window_active).colorref(),
+            sys.DT_SINGLELINE | sys.DT_VCENTER | sys.DT_CENTER | sys.DT_NOPREFIX,
+        );
+    }
+
+    // Caption buttons (always shown, full bar height).
+    _ = sys.SelectObject(mem_dc, self.glyph_font);
+    const buttons = [3]struct { elem: Element, glyph: []const u16 }{
+        .{ .elem = .minimize, .glyph = glyph_minimize },
+        .{ .elem = .maximize, .glyph = if (info.maximized) glyph_restore else glyph_maximize },
+        .{ .elem = .close, .glyph = glyph_close },
+    };
+    for (buttons, 0..) |btn, i| {
+        const idx: i32 = @intCast(i);
+        const br: RECT = .{
+            .left = layout.buttons_x + idx * layout.btn_w,
+            .top = 0,
+            .right = layout.buttons_x + (idx + 1) * layout.btn_w,
+            .bottom = h,
+        };
+        const hovered = self.hover.eql(btn.elem);
+        var glyph_color = pal.textColor(true, self.window_active);
+        if (hovered) {
+            const bg = if (btn.elem.eql(.close)) pal.close_hover else pal.btn_hover;
+            fillRect(mem_dc, br, bg.colorref());
+            if (btn.elem.eql(.close)) glyph_color = .{ .r = 255, .g = 255, .b = 255 };
+        }
+        drawTextUtf16(
+            mem_dc,
+            btn.glyph,
+            br,
+            glyph_color.colorref(),
+            sys.DT_SINGLELINE | sys.DT_VCENTER | sys.DT_CENTER | sys.DT_NOPREFIX,
+        );
+    }
+
+    _ = sys.BitBlt(info.dc, 0, 0, info.width, h, mem_dc, 0, 0, sys.SRCCOPY);
+}
+
 test "palette derives theme-relative colors" {
     const bg: Rgb = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
     const fg: Rgb = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
